@@ -91,10 +91,16 @@ For automatic driver start upon the OS boot, add neuron to startup modules.
 cp neuron.ko /**lib**/**modules**/$(**uname** -**r**)/`
 ```
 
-To enable applications to access neuron devices without needing root privileges create udev rules.
+To enable applications to access neuron devices without needing root privileges,
+create a dedicated `neuron` system group, add authorized users to it, and
+configure udev rules to restrict device access to that group.
 
 ```
-`echo 'KERNEL=="neuron*", MODE="0666"' > /lib/udev/rules.d/neuron-udev.rules`
+sudo groupadd -f neuron
+sudo usermod -aG neuron $USER
+echo 'SUBSYSTEM=="neuron*", KERNEL=="neuron*", GROUP="neuron", MODE="0660"' | sudo tee /lib/udev/rules.d/neuron-udev.rules
+sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 
-
+For more details on securing Neuron device access, see the
+[Neuron Security documentation](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/about-neuron/security.html).
