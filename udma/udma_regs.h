@@ -92,7 +92,9 @@ struct udma_m2s_feature {
 struct udma_m2s_q {
 	/* [0x0] M2S descriptor prefetch configuration */
 	u32 desc_pref_cfg;
-	u32 reserved0[7];
+	/* [0x4] M2S descriptor prefetch configuration 2 */
+	u32 desc_pref_cfg2;
+	u32 reserved0[6];
 	/* [0x20] M2S descriptor ring configuration */
 	u32 cfg;
 	/* [0x24] M2S descriptor ring status and information */
@@ -345,7 +347,11 @@ struct udma_s2m_comp {
 };
 
 struct udma_s2m_q {
-	u32 reserved0[8];
+	/* [0x0] M2S descriptor prefetch configuration */
+	u32 desc_pref_cfg;
+	/* [0x4] M2S descriptor prefetch configuration 2 */
+	u32 desc_pref_cfg2;
+	u32 reserved0[6];
 	/* [0x20] S2M Descriptor ring configuration */
 	u32 cfg;
 	/* [0x24] S2M Descriptor ring status and information */

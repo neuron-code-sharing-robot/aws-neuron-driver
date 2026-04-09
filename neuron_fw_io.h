@@ -20,14 +20,33 @@ union fw_io_request_hdr {
 	} reg;
 };
 
+// Note: Firmware updated to include crc32 field in response header, but 
+// to maintain backward compatibility, keeping original response header
+// struct and adding crc32 field to new header.
+
+// Response header for legacy protocol
+// Used by fw_io_execute_request() for legacy commands
 union fw_io_response_hdr {
 	struct {
 		u8 sequence_number; // request sequence number
 		u8 error_code; // 0 means request was successfully completed
 		u16 size; // response size in bytes including this header
 	} hdr;
+	u32 dw0; // bytes 0-3: sequence_number, error_code, size
+};
+
+// Response header for new protocol
+// Used by fw_io_execute_request_new() for new commands
+union fw_io_response_hdr_new {
 	struct {
-		u32 dw0;
+		u8 sequence_number; // request sequence number
+		u8 error_code; // 0 means request was successfully completed
+		u16 size; // response size in bytes including this header
+		u32 crc32;
+	} hdr;
+	struct {
+		u32 dw0; // bytes 0-3: sequence_number, error_code, size
+		u32 dw1; // bytes 4-7: crc32
 	} reg;
 };
 
@@ -38,6 +57,11 @@ struct fw_io_request {
 
 struct fw_io_response {
 	union fw_io_response_hdr response_hdr;
+	u8 data[];
+};
+
+struct fw_io_response_new {
+	union fw_io_response_hdr_new response_hdr;
 	u8 data[];
 };
 
@@ -53,8 +77,30 @@ union fw_io_req_perfprofile_data {
 };
 
 struct fw_io_get_data_request {
-	uint8_t type;			// fw_io_data_request_type
-	uint8_t reserved[3];	// reserved for future use/alignment
+	uint8_t type;
+};
+
+struct fw_io_get_perfprofile_response {
+	uint8_t reserved[4];
+	uint8_t profile;
+	uint8_t voltage_margin;
+	uint8_t frequency;
+	uint8_t ocw;
+};
+
+struct fw_io_get_available_profiles_request {
+	uint8_t type; // must be 2
+	uint16_t operation; 
+} __packed;
+
+struct fw_io_get_available_profiles_response {
+	uint8_t num_profiles;
+	uint8_t profiles_bitmap[32]; 
+};
+
+enum fw_io_get_available_profiles_feature {
+	FW_IO_AVAILABLE_PERF_PROFILES_ALL = 0,
+	FW_IO_AVAILABLE_PERF_PROFILES_HBM_7200 = 5
 };
 
 // Feature bitmap for FW_IO_CMD_SET_FEATURE
@@ -86,7 +132,7 @@ enum {
 // Bitmap of PIR reset types to be written to FW_IO_REG_RESET_OFFSET
 enum {
 	FW_IO_RESET_TYPE_DEVICE = 1,
-	FW_IO_RESET_TYPE_TPB = 2  // Requires FW_IO_REG_RESET_TPB_MAP_OFFSET to be populated with a tpb map prior to use
+	FW_IO_RESET_TYPE_TPB = 2  // Requires FW_IO_REG_RESET_TPB_MAP_LO_OFFSET to be populated with a tpb map prior to use
 };
 
 // offsets in MISC RAM for FWIO
@@ -98,6 +144,11 @@ enum {
 	//   - This register is used to determine the API version of the firmware.
 	//   - The value of this register is used to determine the offset of other registers.
 	FW_IO_REG_API_VERSION_OFFSET = 0x00,
+
+
+	// MISC RAM instance/partition size info
+	// (0:5) instance size, 16:30 partition size, 31 partition size valid
+	FW_IO_REG_INSTANCE_PARTITION_SZ_OFFSET = 0x30,
 
 	// MISC RAM slots for serial number for V2
 	//   - The lower 32 bits and the upper 32 bits together represent the 64-bit serial number.
@@ -125,6 +176,10 @@ enum {
 	FW_IO_REG_POWER_UTIL_D1_OFFSET = 0x58, // 22 * 4 bytes
 
 	FW_IO_REG_HBM_REPAIR_STATE_OFFSET = 0x64, // 25 * 4 bytes
+											  //
+
+	FW_IO_REG_RESERVATION_ID_HI = 0x80,	// 32 * 4 bytes
+	FW_IO_REG_RESERVATION_ID_LO = 0x84,	// 33 * 4 bytes
 
 	FW_IO_REG_RUNTIME_RESERVED0 = 0xC0, // 0xC0 to 0xF0
 
@@ -138,7 +193,8 @@ enum {
 	FW_IO_REG_POD_SERNUM_LO = 0x198, 
 	FW_IO_REG_RUNTIME_RESERVED1  = 0x1a0, // 0x1a0 to 1d0
 	
-	FW_IO_REG_RESET_TPB_MAP_OFFSET = 0x1d8,
+	FW_IO_REG_RESET_TPB_MAP_HI_OFFSET = 0x1d4,
+	FW_IO_REG_RESET_TPB_MAP_LO_OFFSET = 0x1d8,
 	FW_IO_REG_RESET_OFFSET = 0x1ec,
 	FW_IO_REG_REQUEST_BASE_ADDR_LOW_OFFSET = 0x1f4,
 	FW_IO_REG_REQUEST_BASE_ADDR_HIG_OFFSET = 0x1f0,
@@ -147,7 +203,47 @@ enum {
 	FW_IO_REG_TRIGGER_INT_NOSEC_OFFSET = 0x800,
 	FW_IO_REG_ACK_OFFSET = 0xf0,
 };
-	
+
+// Instance/partition register field decode
+//
+#define _REG_INSTPARTSZ_INSTBITS	6
+#define _REG_INSTPARTSZ_INSTSHIFT 	0
+#define _REG_INSTPARTSZ_INSTMASK	((1 << _REG_INSTPARTSZ_INSTBITS)-1)
+#define _REG_INSTPARTSZ_INST(inst)	(((inst) >> _REG_INSTPARTSZ_INSTSHIFT) & _REG_INSTPARTSZ_INSTMASK)
+
+#define _REG_INSTPARTSZ_PARTBITS	15
+#define _REG_INSTPARTSZ_PARTSHIFT 	16
+#define _REG_INSTPARTSZ_PARTMASK	((1 << _REG_INSTPARTSZ_PARTBITS)-1)
+#define _REG_INSTPARTSZ_PART(part)	(((part) >> _REG_INSTPARTSZ_PARTSHIFT) & _REG_INSTPARTSZ_PARTMASK)
+
+#define _REG_INSTPARTSZ_VALBITS		1
+#define _REG_INSTPARTSZ_VALSHIFT 	31
+#define _REG_INSTPARTSZ_VALMASK		((1 << _REG_INSTPARTSZ_VALBITS)-1)
+#define _REG_INSTPARTSZ_VAL(val)	(((val) >> _REG_INSTPARTSZ_VALSHIFT) & _REG_INSTPARTSZ_VALMASK)
+
+// server info register field decode
+//
+#define _REG_SERVERINFO_SERVERBITS		15
+#define _REG_SERVERINFO_SERVERSHIFT 	0
+#define _REG_SERVERINFO_SERVERMASK		((1 << _REG_SERVERINFO_SERVERBITS)-1)
+#define _REG_SERVERINFO_SERVER(serv)	(((serv) >> _REG_SERVERINFO_SERVERSHIFT) & _REG_SERVERINFO_SERVERMASK)
+
+#define _REG_SERVERINFO_SVALIDBITS		1 
+#define _REG_SERVERINFO_SVALIDSHIFT 	15
+#define _REG_SERVERINFO_SVALIDMASK		((1 << _REG_SERVERINFO_SVALIDBITS)-1)
+#define _REG_SERVERINFO_SVALID(sval)	(((sval) >> _REG_SERVERINFO_SVALIDSHIFT) & _REG_SERVERINFO_SVALIDMASK)
+
+#define _REG_SERVERINFO_RACKBITS		15
+#define _REG_SERVERINFO_RACKSHIFT 		16
+#define _REG_SERVERINFO_RACKMASK		((1 << _REG_SERVERINFO_RACKBITS)-1)
+#define _REG_SERVERINFO_RACK(rack)		(((rack) >> _REG_SERVERINFO_RACKSHIFT) & _REG_SERVERINFO_RACKMASK)
+
+#define _REG_SERVERINFO_RVALIDBITS		1 
+#define _REG_SERVERINFO_RVALIDSHIFT 	31
+#define _REG_SERVERINFO_RVALIDMASK		((1 << _REG_SERVERINFO_RVALIDBITS)-1)
+#define _REG_SERVERINFO_RVALID(rval)	(((rval) >> _REG_SERVERINFO_RVALIDSHIFT) & _REG_SERVERINFO_RVALIDMASK)
+
+//
 #define FW_IO_REG_METRIC_BUF_SZ 128
 
 struct fw_io_ctx {
@@ -287,11 +383,15 @@ int fw_io_post_metric_new(struct fw_io_ctx *ctx, u8 *data, u32 size);
  *
  * @bar0: Device's BAR0 base address
  * @device_reset: True if we are doing a device-level reset
- * @tpb_reset_map: If device_reset is false (tpb reset), bitmap of blocks to reset
- *     [1:0] NC mask
- *     [13:8] TopSp mask
+ * @tpb_reset_map_lo: If device_reset is false (tpb reset), bitmap of blocks to reset (bits 0-31)
+ *     [7:0]   TPB mask
+ *     [15:8]  SDMA group mask
+ *     [23:16] TOP_SP mask
+ *     [31:24] CC_TOP mask
+ * @tpb_reset_map_hi:
+ *     [3:0]   Top-Level DMA group mask
  */
-void fw_io_initiate_reset(void __iomem *bar0, bool device_reset, u32 tpb_reset_map);
+void fw_io_initiate_reset(void __iomem *bar0, bool device_reset, u32 tpb_reset_map_lo, u32 tpb_reset_map_hi);
 
 /**
  * fw_io_is_reset_initiated() - Check if local reset is initiated or not.
@@ -319,10 +419,29 @@ int fw_io_read_counters(struct fw_io_ctx *ctx, uint64_t addr_in[], uint32_t val_
 /**
  * fw_io_server_info_read() - Read server info
  * @param bar - from bar
- * @param server_info  - server info containing rack & server ids
+ * @param server_id - server id or -1 if invalid
+ * @param rack_id - rack id or -1 if invalid
  * @return  0 on success.
  */
-int fw_io_server_info_read(void *bar0, u32 *server_info);
+int fw_io_server_info_read(void *bar0, int *server_id, int * rack_id);
+
+
+/**
+ * fw_io_reservation_id_read() - Read reservation id
+ * @param bar - from bar
+ * @param reservation_id - server reservation id
+ * @return  0 on success.
+ */
+int fw_io_reservation_id_read(void *bar0, uint64_t *reservation_id);
+
+/**
+ * fw_io_instance_partition_sz_read() - instance/partition sizes
+ * @param bar - from bar
+ * @param instance_sz - instance size.  -1 if invalid
+ * @param partition_sz - partition size.  -1 if invalid
+ * @return  0 on success.
+ */
+int fw_io_instance_partition_sz_read(void *bar0, int *instance_sz, int *partition_sz);
 
 /**
  * fw_io_device_id_read() - Read device id
@@ -434,10 +553,28 @@ int fw_io_execute_request_new(struct fw_io_ctx *ctx, u8 command_id, const u8 *re
 int fw_io_set_power_profile(struct fw_io_ctx *ctx, uint32_t profile);
 
 /**
+ * fw_io_get_performance_profile() - Get current performance profile
+ * @param ctx: FWIO context
+ * @param profile: Pointer to store the current profile value
+ * @return 0 on success, negative on failure
+ */
+int fw_io_get_performance_profile(struct fw_io_ctx *ctx, uint32_t *profile);
+
+/**
  * fw_io_enable_throttling_notifications() - Enable throttling notifications
  * @param ctx: FWIO context
  * @param enable: true to enable, false to disable
  * @return 0 on success, negative on failure
  */
 int fw_io_enable_throttling_notifications(struct fw_io_ctx *ctx, bool enable);
+
+/**
+ * fw_io_get_available_profiles() - Get available profiles
+ * @param ctx: FWIO context
+ * @param feature: Profiles with a particular feature (0 for all profiles supported by instance)
+ * @param num_profiles: Number of valid profiles in response
+ * @param bitmap: Bitmap of supported profiles in response
+ */
+int fw_io_get_available_profiles(struct fw_io_ctx *ctx, u16 feature, u8 *num_profiles, u8 bitmap[32]);
+
 #endif

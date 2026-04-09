@@ -30,7 +30,6 @@ struct ndhal_arch {
 struct ndhal_address_map {
 	// addresses
 	uint64_t pci_host_base;
-	uint64_t mmap_p_offset;
 	uint64_t mmap_nc_event_offset;
 	uint64_t mmap_nc_sema_read_offset;
 	uint64_t mmap_nc_sema_set_offset;
@@ -38,9 +37,6 @@ struct ndhal_address_map {
 	uint64_t mmap_nc_sema_decr_offset;
 	uint64_t bar0_misc_ram_offset;
 	uint64_t port_1_base;
-
-	// sizes
-	uint64_t mmap_nc_size;
 
 	// counts
 	int nc_per_device;
@@ -56,13 +52,12 @@ struct ndhal_address_map {
 };
 
 struct ndhal_reset {
-    uint64_t reset_poll_interval;
     uint64_t reset_tpb_initial_poll_delay;
 	uint64_t initiate_max_wait_time;
     uint32_t retry_count;
     int (*nr_initiate_reset) (struct neuron_device *nd, uint32_t nc_map);
     int (*nr_wait_for_reset_completion) (struct neuron_device *nd);
-	int (*nr_post_reset_config) (struct neuron_device *nd, bool reset_successful);
+	int (*nr_post_reset_config) (struct neuron_device *nd, bool reset_successful, bool is_no_reset);
 };
 
 struct ndhal_topsp {
@@ -75,8 +70,8 @@ struct ndhal_topsp {
 };
 
 struct ndhal_nc {
-    void *(*nc_get_semaphore_base) (struct neuron_device *nd, u8 nc_id);
-    void *(*nc_get_event_addr) (struct neuron_device *nd, u8 nc_id, u16 event_index);
+    int (*nc_get_semaphore_base) (struct neuron_device *nd, u8 nc_id, void **sem_base);
+    int (*nc_get_event_addr) (struct neuron_device *nd, u8 nc_id, u16 event_index, void **ev_addr);
 };
 
 struct ndhal_nq {
@@ -89,8 +84,7 @@ struct ndhal_mpset {
     u64 device_dram_effective_base_addr[MAX_DRAM_CHANNELS];
     u64 device_dram_end_addr[MAX_DRAM_CHANNELS];
     bool small_pool_supported;
-    void (*mpset_set_dram_and_mpset_info) (struct mempool_set *mpset, u64 *device_dram_addr, u64 *device_dram_size);
-    int (*mpset_block_carveout_regions) (struct neuron_device *nd, struct mempool_set *mpset, u64 *device_dram_addr, u64 *device_dram_size);
+    void (*mpset_set_dram_and_mpset_info) (struct neuron_mempool_set *mpset, u64 *device_dram_addr, u64 *device_dram_size);
 };
 
 struct ndhal_ndmar {
@@ -100,7 +94,6 @@ struct ndhal_ndmar {
     bool (*nr_init_h2t_eng) ( int nc_idx, uint32_t nc_map); 
     bool (*ndmar_is_nx_ring) (uint32_t eng_id, uint32_t q_id);
     int (*ndmar_quiesce_queues) (struct neuron_device *nd, u32 nc_id, u32 engine_count, u32 *queue_mask);
-    void (*ndmar_set_model_started) (struct neuron_device *nd, phys_addr_t pa, struct mem_chunk *mc);
 };
 
 struct ndhal_fw_io {
@@ -109,10 +102,6 @@ struct ndhal_fw_io {
     int (*fw_io_read_csr_array) (void **addrs, u32 *values, u32 num_csrs, bool operational);
     int (*fw_io_execute_request) (struct fw_io_ctx *ctx, u8 command_id, const u8 *req, u32 req_size, u8 *resp, u32 resp_size);
     int (*fw_io_post_metric) (struct fw_io_ctx *ctx, u8 *data, u32 size);
-};
-
-struct ndhal_reg_access {
-    int (*reg_read32_array) (void **addr, u32 *value, u32 num_values);
 };
 
 struct ndhal_mmap {
@@ -150,14 +139,6 @@ struct ndhal_pci {
     int dram_bar;
     u64 dram_bar_size;
 
-    int (*neuron_pci_release_bar) (struct pci_dev *dev, int bar);
-    int (*neuron_pci_reserve_bar) (struct pci_dev *dev, int bar, const char *res_name);
-    int (*neuron_pci_set_npdev) (struct pci_dev *dev,
-                                int bar,
-                                const char *res_name,
-                                phys_addr_t *bar_pa,
-                                void __iomem **bar_ioaddr,
-                                u64 *bar_size);
     int (*neuron_pci_get_device_id) (struct neuron_device *nd, struct pci_dev *dev);
     int (*neuron_pci_device_id_to_rid_map) (uint32_t * count, uint32_t * did_to_rid_map);
 };
@@ -167,12 +148,12 @@ struct ndhal_cdev {
     u64 *ncdev_bar0_write_blocked_addrs;
 
     void (*ncdev_compatible_version) (struct neuron_ioctl_compatible_version *arg);
-    void (*ncdev_quiesce_exec_on_proc_exit) (void);
     int (*ncdev_logical_to_physical_nc_map)(struct neuron_ioctl_nc_map *map, uint32_t max_num_entries, enum neuron_ioctl_nc_mapping_type mapping_type);
     void (*ncdev_get_default_tpbs_for_hbm) (u32 hbm_index, u32 tpbs[MAX_NC_PER_DEVICE], u32 *tpb_count);
 };
 
 struct ndhal_udma {
+	unsigned int num_queues;
 	unsigned int num_beats;
 };
 
@@ -193,6 +174,7 @@ struct ndhal_npe {
 	int (*npe_pod_status)( u32 *pod_state, s8 *node_id);
 	int (*npe_pod_ctrl)( struct neuron_device *nd, u32 pod_ctrl, enum neuron_ultraserver_mode mode, u32 timeout, u32 *pod_state);
 	ssize_t (*npe_class_node_id_show_data)(char *buf, u32 sz);
+	ssize_t (*npe_class_node_cnt_show_data)(char *buf);
 	ssize_t (*npe_class_server_id_show_data)(char *buf, u32 sz);
 	ssize_t (*npe_class_ultraserver_mode_show_data)(char *buf);
 	u32 (*npe_neighbor_eng_ids)[2];
@@ -217,6 +199,9 @@ struct ndhal_tpb {
 struct ndhal_perf {
     int current_performance_profile;
     int (*perf_set_profile) (struct neuron_device *nd, uint32_t profile);
+    int (*perf_get_profile) (struct neuron_device *nd, uint32_t *profile);
+    int (*perf_get_supported_profiles) (struct neuron_device *nd, u16 feature, u8 *num_profiles, u8 out_bitmap[32]);
+    void (*perf_update_hbm_7200_supported) (struct neuron_device *nd);
 };
 
 struct neuron_dhal {
@@ -231,7 +216,6 @@ struct neuron_dhal {
     struct ndhal_mpset ndhal_mpset;
     struct ndhal_ndmar ndhal_ndmar;
     struct ndhal_fw_io ndhal_fw_io;
-    struct ndhal_reg_access ndhal_reg_access;
     struct ndhal_mmap ndhal_mmap;
     struct ndhal_sysfs_metrics ndhal_sysfs_metrics;
     struct ndhal_pci ndhal_pci;

@@ -133,17 +133,71 @@ int fw_io_api_version_read(void * bar0, u32 *version)
 	return ret;
 }
 
-int fw_io_server_info_read(void *bar0, u32 *server_info)
+int fw_io_server_info_read(void *bar0, int *server_id, int * rack_id)
 {
 	int ret;
+	uint32_t server_info;
 
 	void *addr = bar0 + ndhal->ndhal_address_map.bar0_misc_ram_offset + FW_IO_REG_SERVER_RACK_ID_OFFSET;
-	ret = ndhal->ndhal_fw_io.fw_io_read_csr_array(&addr, server_info, 1, true);
+	ret = ndhal->ndhal_fw_io.fw_io_read_csr_array(&addr, &server_info, 1, true);
 	if (ret) {
 		pr_err("failed to get server info from the device, ret = %d\n", ret);
+		return -EIO;
 	}
 
-	return ret;
+	if (server_id != NULL) {
+		*server_id = _REG_SERVERINFO_SVALID(server_info) ? _REG_SERVERINFO_SERVER(server_info) : -1;
+	}
+	if (rack_id != NULL) {
+		*rack_id =  _REG_SERVERINFO_RVALID(server_info) ? _REG_SERVERINFO_RACK(server_info) : -1;
+	}
+	return 0;
+}
+
+int fw_io_reservation_id_read(void *bar0, uint64_t *reservation_id)
+{
+	int ret;
+	uint32_t reservation_id_lo;
+	uint32_t reservation_id_hi;
+	void *addr;
+
+	addr = bar0 + ndhal->ndhal_address_map.bar0_misc_ram_offset + FW_IO_REG_RESERVATION_ID_LO;
+	ret = ndhal->ndhal_fw_io.fw_io_read_csr_array(&addr, &reservation_id_lo, 1, true);
+	if (ret) {
+		pr_err("failed to get the lower 32 bits of the reservation id from the device\n");
+		return -EIO;
+	}
+	addr = bar0 + ndhal->ndhal_address_map.bar0_misc_ram_offset + FW_IO_REG_RESERVATION_ID_HI;
+	ret = ndhal->ndhal_fw_io.fw_io_read_csr_array(&addr, &reservation_id_hi, 1, true);
+	if (ret) {
+		pr_err("failed to get the upper 32 bits of the reservation id from the device\n");
+		return -EIO;
+	}
+	
+	*reservation_id = ((uint64_t)reservation_id_hi << 32) | reservation_id_lo;
+	return 0;
+}
+
+int fw_io_instance_partition_sz_read(void *bar0, int *instance_sz, int *partition_sz)
+{
+	int ret;
+	uint32_t instance_partition_sz;
+
+	void *addr = bar0 + ndhal->ndhal_address_map.bar0_misc_ram_offset + FW_IO_REG_INSTANCE_PARTITION_SZ_OFFSET;
+	ret = ndhal->ndhal_fw_io.fw_io_read_csr_array(&addr, &instance_partition_sz, 1, true);
+	if (ret) {
+		pr_err("failed to get instance/partition size info from the device, ret = %d\n", ret);
+		return -EIO;
+	}
+
+	if (instance_sz != NULL) {
+		*instance_sz = _REG_INSTPARTSZ_INST(instance_partition_sz);
+	}
+	if (partition_sz != NULL) {
+		*partition_sz = _REG_INSTPARTSZ_VAL(instance_partition_sz) ? _REG_INSTPARTSZ_PART(instance_partition_sz) : -1;
+	}
+
+	return 0;
 }
 
 int fw_io_device_id_read(void *bar0, u32 *device_id)
@@ -229,12 +283,16 @@ static void dx_crc32c_add(const u8 *data, size_t len, u32 *csum)
 	}
 }
 
+// Note: fw_io_cmd_timeout_tbl is only used in fw_io_execute_request_new().
+// The timeouts only apply to cmd 3-5 as cmd 1-2 are still using legacy framework.
+// In the future when switching cmd 1-2 to new framework, will likely need to
+// bump timeout to 10s as fimrware side request can complete ranging from 100ms to 7s.
 static const u32 fw_io_cmd_timeout_tbl[FW_IO_CMD_MAX] = {
 	0,                   // cmd 0
 	(1000 * 1000 * 1),   // cmd 1 (FW_IO_CMD_READ)
 	(1000 * 1000 * 1),   // cmd 2 (FW_IO_CMD_POST_TO_CW)
-	(1000 * 1000 * 60),  // cmd 3 (FW_IO_CMD_SET_POWER_PROFILE)
-	(1000 * 1000 * 1),   // cmd 4 (FW_IO_CMD_GET_DATA)
+	(1000 * 1000 * 90),  // cmd 3 (FW_IO_CMD_SET_POWER_PROFILE)
+	(1000 * 1000 * 10),   // cmd 4 (FW_IO_CMD_GET_DATA)
 	(1000 * 1000 * 60),   // cmd 5 (FW_IO_CMD_SET_FEATURE)
 };
 
@@ -409,7 +467,7 @@ int fw_io_execute_request_new(struct fw_io_ctx *ctx, u8 command_id, const u8 *re
 		}
 		
 		// Read response header
-		union fw_io_response_hdr resp_header;
+		union fw_io_response_hdr_new resp_header;
 		reg_read32(ctx->bar0 + ndhal->ndhal_address_map.bar0_misc_ram_offset + FW_IO_REG_REQUEST_BASE_ADDR_HIG_OFFSET, &resp_header.reg.dw0);
 
 		if (resp_header.hdr.sequence_number != ctx->next_seq_num) {
@@ -423,8 +481,14 @@ int fw_io_execute_request_new(struct fw_io_ctx *ctx, u8 command_id, const u8 *re
 			if (data_size > 0 && resp != NULL) {
 				u32 copy_size = min(resp_size, data_size);
 				u32 *resp_data = (u32*)resp;
-				for (j = 0; j < (copy_size + 3) / 4; j++) {
+				for (j = 0; j < copy_size / 4; j++) {
 					reg_read32(ctx->bar0 + ndhal->ndhal_address_map.bar0_misc_ram_offset + FW_IO_REG_DATA_OFFSET + j*4, &resp_data[j]);
+				}
+				if (copy_size % 4) {
+					u32 remaining_resp = 0;
+					int idx = copy_size/4;
+					reg_read32(ctx->bar0 + ndhal->ndhal_address_map.bar0_misc_ram_offset + FW_IO_REG_DATA_OFFSET + idx*4, &remaining_resp);
+					memcpy(&resp_data[idx], &remaining_resp, copy_size % 4);
 				}
 			}
 			ret = 0;
@@ -433,8 +497,8 @@ int fw_io_execute_request_new(struct fw_io_ctx *ctx, u8 command_id, const u8 *re
 
 		ctx->fw_io_err_count++;
 		pr_err(KERN_ERR "seq: %u, cmd: %u failed %u\n", ctx->next_seq_num, command_id, resp_header.hdr.error_code);
+		ret = -1;
 		if (resp_header.hdr.error_code == FW_IO_UNKNOWN_COMMAND) {
-			ret = -1;
 			break;
 		}
 	}
@@ -551,22 +615,23 @@ int fw_io_read_csr_array_readless(void **ptrs, u32 *values, u32 num_csrs)
 	return -1;
 }
 
-void fw_io_initiate_reset(void __iomem *bar0, bool device_reset, u32 tpb_reset_map)
+void fw_io_initiate_reset(void __iomem *bar0, bool device_reset, u32 tpb_reset_map_lo, u32 tpb_reset_map_hi)
 {
-	u32 reset_type;
-	void *address;
-	if (device_reset) {
-		reset_type = FW_IO_RESET_TYPE_DEVICE;
-	} else {
-		reset_type = FW_IO_RESET_TYPE_TPB;
-		address = bar0 + ndhal->ndhal_address_map.bar0_misc_ram_offset + FW_IO_REG_RESET_TPB_MAP_OFFSET;
-		reg_write32((u32 *)address, tpb_reset_map);
-		mb();
-	}
-	address = bar0 + ndhal->ndhal_address_map.bar0_misc_ram_offset + FW_IO_REG_RESET_OFFSET;
-	reg_write32((u32 *)address, reset_type);
-	mb();
-	fw_io_trigger(bar0);
+    void __iomem *misc_ram_addr = bar0 + ndhal->ndhal_address_map.bar0_misc_ram_offset;
+    u32 reset_type;
+
+    if (device_reset) {
+        reset_type = FW_IO_RESET_TYPE_DEVICE;
+    } else {
+        reset_type = FW_IO_RESET_TYPE_TPB;
+        reg_write32(misc_ram_addr + FW_IO_REG_RESET_TPB_MAP_LO_OFFSET, tpb_reset_map_lo);
+        reg_write32(misc_ram_addr + FW_IO_REG_RESET_TPB_MAP_HI_OFFSET, tpb_reset_map_hi);
+        mb();
+    }
+
+    reg_write32(misc_ram_addr + FW_IO_REG_RESET_OFFSET, reset_type);
+    mb();
+    fw_io_trigger(bar0);
 }
 
 bool fw_io_is_reset_initiated(void __iomem *bar0)
@@ -762,6 +827,27 @@ int fw_io_set_power_profile(struct fw_io_ctx *ctx, uint32_t profile)
 	return fw_io_execute_request_new(ctx, FW_IO_CMD_SET_POWER_PROFILE, (u8 *)&data, sizeof(data), NULL, 0);
 }
 
+int fw_io_get_performance_profile(struct fw_io_ctx *ctx, uint32_t *profile)
+{
+	struct fw_io_get_data_request req = {0};
+	struct fw_io_get_perfprofile_response resp = {0};
+	int ret;
+	if (!ctx || !profile) {
+		return -EINVAL;
+	}
+
+	req.type = 1;
+
+	ret = fw_io_execute_request_new(ctx, FW_IO_CMD_GET_DATA, (u8 *)&req, sizeof(req), (u8 *)&resp, sizeof(resp));
+	if (ret == 0) {
+		*profile = (uint32_t)resp.profile;
+	} else {
+		pr_err("failed to get profile, ret = %d\n", ret);
+	}
+
+	return ret;
+}
+
 int fw_io_enable_throttling_notifications(struct fw_io_ctx *ctx, bool enable)
 {	/*
 	 * Note: 
@@ -784,4 +870,26 @@ int fw_io_enable_throttling_notifications(struct fw_io_ctx *ctx, bool enable)
 	}
 
 	return fw_io_execute_request_new(ctx, FW_IO_CMD_SET_FEATURE, &features, sizeof(features), NULL, 0);
+}
+
+int fw_io_get_available_profiles(struct fw_io_ctx *ctx, u16 feature, u8 *num_profiles, u8 bitmap[32])
+{
+	struct fw_io_get_available_profiles_request req;
+	struct fw_io_get_available_profiles_response response;
+	int ret;
+	if (!ctx) {
+		return -EINVAL;
+	}
+
+	req.type = 2;
+	req.operation = feature;
+
+	ret = fw_io_execute_request_new(ctx, FW_IO_CMD_GET_DATA, (u8*)&req, sizeof(req), (u8*)&response, sizeof(response));
+	if (ret) {
+		return ret;
+	}
+
+	*num_profiles = response.num_profiles;
+	memcpy(bitmap, response.profiles_bitmap, sizeof(response.profiles_bitmap));
+	return 0;
 }

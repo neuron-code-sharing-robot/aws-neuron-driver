@@ -637,13 +637,27 @@ struct neuron_ioctl_get_va_placement {
 	__s32 device_index;		// [out] Neuron device index (negative if VA does not represent Neuron memory)
 	__s32 hbm_index;		// [out] HBM index
 };
+struct neuron_ioctl_available_perf_profiles {
+	__u16 requested_feature; // [in] - 0 means all available profiles (no feature filter)
+	__u8 num_profiles; // [out]
+	__u8 bitmap[32]; // [out] firmware limited to 256 profiles
+};
+
+struct neuron_ioctl_get_async_h2t_dma_compl_queues {
+	__u32 nc_id;		/* [in] neuron core id */
+	__u32 qid_bitmap;	/* [in] bitmap of dma queues requested */
+	struct {
+		__u64 mmap_offset;  /* [out] mmap offset of each completion queue */
+		__u32 mmap_size;	/* [out] mmap size of queue + metadata */
+	} compl_queue_info[16];
+};
+
 
 #define NEURON_IOCTL_BASE 'N'
 
 /* Deprecated reset related IOCTLs. Now it would always return success. */
 #define NEURON_IOCTL_DEVICE_RESET _IO(NEURON_IOCTL_BASE, 1)
 #define NEURON_IOCTL_DEVICE_READY _IOR(NEURON_IOCTL_BASE, 2, __u8)
-#define NEURON_IOCTL_DEVICE_RESET_STATUS _IOR(NEURON_IOCTL_BASE, 106, __u8)
 
 /** Returns devices information and connection topology. */
 #define NEURON_IOCTL_DEVICE_INFO _IOR(NEURON_IOCTL_BASE, 3, struct neuron_ioctl_device_info *)
@@ -665,9 +679,6 @@ struct neuron_ioctl_get_va_placement {
 
 /** Allocated memory and return a memory_handle. */
 #define NEURON_IOCTL_MEM_ALLOC _IOR(NEURON_IOCTL_BASE, 21, struct neuron_ioctl_mem_alloc *)
-#define NEURON_IOCTL_MEM_ALLOC_V2 _IOR(NEURON_IOCTL_BASE, 102, struct neuron_ioctl_mem_alloc_v2 *) // V2 here refers to neuron 2.x, not arch type
-#define NEURON_IOCTL_MEM_ALLOC_V2MT _IOR(NEURON_IOCTL_BASE, 102, struct neuron_ioctl_mem_alloc_v2_mem_type) // just V2 with additional field mem_type
-#define NEURON_IOCTL_MEM_ALLOC_V2MT64 _IOR(NEURON_IOCTL_BASE, 102, struct neuron_ioctl_mem_alloc_v2_mem_type64) // V2 + mem_type + pad
 
 /** Free given memory_handle. */
 #define NEURON_IOCTL_MEM_FREE _IOR(NEURON_IOCTL_BASE, 22, struct neuron_ioctl_mem_free *)
@@ -703,8 +714,6 @@ struct neuron_ioctl_get_va_placement {
 #define NEURON_IOCTL_DMA_ENG_GET_STATE _IOWR(NEURON_IOCTL_BASE, 32, struct neuron_ioctl_dma_eng_get_state *)
 /** Initializes given DMA queue */
 #define NEURON_IOCTL_DMA_QUEUE_INIT _IOR(NEURON_IOCTL_BASE, 33, struct neuron_ioctl_dma_queue_init *)
-
-#define NEURON_IOCTL_DMA_QUEUE_INIT_BATCH _IOR(NEURON_IOCTL_BASE, 133, struct neuron_ioctl_dma_queue_init_batch)
 
 /** Releases given DMA queue */
 #define NEURON_IOCTL_DMA_QUEUE_RELEASE _IOR(NEURON_IOCTL_BASE, 34, struct neuron_ioctl_dma_queue_release *)
@@ -772,6 +781,11 @@ struct neuron_ioctl_get_va_placement {
 /** Returns pci device information - only for devices opened by the calling proceess (deprecated, don't use) */
 #define NEURON_IOCTL_DEVICE_BDF _IOR(NEURON_IOCTL_BASE, 101, struct neuron_ioctl_device_bdf *)
 
+/** Allocated memory and return a memory_handle. */
+#define NEURON_IOCTL_MEM_ALLOC_V2 _IOR(NEURON_IOCTL_BASE, 102, struct neuron_ioctl_mem_alloc_v2 *) // V2 here refers to neuron 2.x, not arch type
+#define NEURON_IOCTL_MEM_ALLOC_V2MT _IOR(NEURON_IOCTL_BASE, 102, struct neuron_ioctl_mem_alloc_v2_mem_type) // just V2 with additional field mem_type
+#define NEURON_IOCTL_MEM_ALLOC_V2MT64 _IOR(NEURON_IOCTL_BASE, 102, struct neuron_ioctl_mem_alloc_v2_mem_type64) // V2 + mem_type + pad
+
 /** Resets the requested NC (-1 for full device) */
 #define NEURON_IOCTL_NC_RESET _IOR(NEURON_IOCTL_BASE, 103, struct neuron_ioctl_device_reset *)
 
@@ -781,6 +795,9 @@ struct neuron_ioctl_get_va_placement {
 /** Neuron-core specific versions of program_engine ioctl to target right cores/dmas */
 #define NEURON_IOCTL_PROGRAM_ENGINE_NC _IOWR(NEURON_IOCTL_BASE, 105, struct neuron_ioctl_program_engine_nc *)
 #define NEURON_IOCTL_PROGRAM_ENGINE_NC64 _IOWR(NEURON_IOCTL_BASE, 105, struct neuron_ioctl_program_engine_nc64)
+
+/* Deprecated reset related IOCTLs. Now it would always return success. */
+#define NEURON_IOCTL_DEVICE_RESET_STATUS _IOR(NEURON_IOCTL_BASE, 106, __u8)
 
 /** Returns pci device information for any Neuron devices (not just these opened by the calling process */
 #define NEURON_IOCTL_DEVICE_BDF_EXT _IOR(NEURON_IOCTL_BASE, 106, struct neuron_ioctl_device_bdf_ext *)
@@ -847,7 +864,13 @@ struct neuron_ioctl_get_va_placement {
 
 #define NEURON_IOCTL_GET_VA_PLACEMENT _IOW(NEURON_IOCTL_BASE, 131, struct neuron_ioctl_get_va_placement)
 
-// Note: 133 is taken by NEURON_IOCTL_DMA_QUEUE_INIT_BATCH
-#define NEURON_IOCTL_MAX 132
+#define NEURON_IOCTL_GET_PERFORMANCE_PROFILE _IOWR(NEURON_IOCTL_BASE, 132, struct neuron_ioctl_power_profile)
+
+/** Batch DMA initialization given DMA queue */
+#define NEURON_IOCTL_DMA_QUEUE_INIT_BATCH _IOR(NEURON_IOCTL_BASE, 133, struct neuron_ioctl_dma_queue_init_batch)
+
+#define NEURON_IOCTL_AVAILABLE_PERF_PROFILES _IOWR(NEURON_IOCTL_BASE, 134, struct neuron_ioctl_available_perf_profiles)
+
+#define NEURON_IOCTL_GET_ASYNC_H2T_DMA_COMPL_QUEUES _IOWR(NEURON_IOCTL_BASE, 135, struct neuron_ioctl_get_async_h2t_dma_compl_queues)
 
 #endif

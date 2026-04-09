@@ -210,9 +210,25 @@ typedef struct neuron_memcpy_batch {
 	void *context;                  // [in] TBD. opaque context pointer passed back in completion queue
 } neuron_memcpy_batch_t;
 
+/* H2D Completion Queue Entry (CQE) */
+typedef struct neuron_h2d_dma_compl_queue_entry {
+    __u64 sequence_num; // Sequence number for the submitted IO request from runtime (0 means empty slot).
+    __s64 compl_ret;    // Completion status for the request (0 success; negative errno on failure; positive to be used for future).
+    void *context;      // Opaque context pointer copied from submission and represents a pointer to xu_error_list_t in runtime.
+} neuron_h2d_dma_compl_queue_entry_t;
+
+/* H2D DMA Completion Queue (CQ) */
+typedef struct neuron_h2d_dma_compl_queue {
+	__u32 capacity;	// Capacity of the completion queue (number of CQEs).
+	__u32 head;		// Free-running index of the next CQE to be consumed by runtime.
+	__u32 tail;		// Free-running index of the next free CQE to be written by driver.
+	// CQEs are laid out immediately after the header in the same mmap region.
+	neuron_h2d_dma_compl_queue_entry_t entries[]; // offset to the CQE array of the completion queue.
+} neuron_h2d_dma_compl_queue_t;
+
 /*
  * Memory allocation categories for sysfs counters
-*/
+ */
 typedef enum {
 	NEURON_MEMALLOC_TYPE_UNKNOWN_HOST, // only for old runtimes, do not use elsewhere
 	NEURON_MEMALLOC_TYPE_CODE_HOST,
@@ -244,16 +260,18 @@ typedef enum {
 /*
  * NDS stats
  * Note: 
- * 	To add a new counter type inside the enum, 
- * 		1. you need to manually decrease NDS_ND_COUNTER_RESERVED or NDS_NC_COUNTER_RESERVED by 1
- * 		2. you need to update NDS_ND_COUNTER_COUNT or NDS_NC_COUNTER_COUNT
- * 	To prevent compatability issues, you need to always append the new counter type to the end of the enum
+ * 	To add a new counter type inside the enum, you need to manually
+ *  decrease NDS_ND_COUNTER_RESERVED or NDS_EXT_NC_COUNTER_ADDED_RESERVED by 1.
+ *
+ * 	To prevent compatability issues, you need to always append the new counter type
+ *  to the end of the enum, before NDS_ND_COUNTER_LAST or NDS_EXT_NC_COUNTER_LAST
  */
-#define NDS_ND_COUNTER_RESERVED 18
+#define NDS_ND_COUNTER_RESERVED 17
 
 // Device counter types
 enum {
-	NDS_ND_COUNTER_RUNTIME_VERSION,
+	NDS_ND_COUNTER_START = 0,
+	NDS_ND_COUNTER_RUNTIME_VERSION = NDS_ND_COUNTER_START,
 	NDS_ND_COUNTER_FRAMEWORK_VERSION,
 	NDS_ND_COUNTER_FAL_VERSION,
 	NDS_ND_COUNTER_FEATURE_BITMAP,
@@ -270,8 +288,10 @@ enum {
 	NDS_ND_COUNTER_DYNAMIC_SYSFS_METRIC_BITMAP,
 
 	NDS_ND_COUNTER_DEVICE_CLUSTER_ID,
+	NDS_ND_COUNTER_AGG_NEFF_ID,
+	NDS_ND_COUNTER_LAST,
 
-	NDS_ND_COUNTER_COUNT = NDS_ND_COUNTER_DEVICE_CLUSTER_ID + NDS_ND_COUNTER_RESERVED + 1
+	NDS_ND_COUNTER_COUNT = NDS_ND_COUNTER_LAST + NDS_ND_COUNTER_RESERVED
 };
 
 #define NDS_NC_COUNTER_RESERVED 0
@@ -329,8 +349,9 @@ enum {
 	NDS_NC_COUNTER_MAC_COUNT,
 
 	NDS_NC_COUNTER_OOB,
+	NDS_NC_COUNTER_LAST,
 
-	NDS_NC_COUNTER_COUNT = NDS_NC_COUNTER_OOB + NDS_NC_COUNTER_RESERVED + 1
+	NDS_NC_COUNTER_COUNT = NDS_NC_COUNTER_LAST + NDS_NC_COUNTER_RESERVED
 };
 
 #define NDS_MAX_NEURONCORE_COUNT     (4)

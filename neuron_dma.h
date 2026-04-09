@@ -6,6 +6,8 @@
 #ifndef NEURON_DMA_H
 #define NEURON_DMA_H
 
+#include <linux/mm_types.h>
+
 #include "udma/udma.h"
 
 #include "neuron_mempool.h"
@@ -200,7 +202,7 @@ dma_addr_t ndma_mc_to_pa(struct mem_chunk *mc);
 bool ndma_zerocopy_supported(void);
 
 /**
- * ndma_memcpy_zerocopy - Perform a pipelined zero-copy DMA transfer.
+ * ndma_zerocopy_submit() - Perform a pipelined zero-copy DMA transfer.
  * @nd: Neuron device whose DMA engine is used.
  * @nc_id: Neuron core identifier owning the queue.
  * @ops: Array of host buffer descriptors.
@@ -208,6 +210,7 @@ bool ndma_zerocopy_supported(void);
  * @dev_base: Base device physical address for the transfer.
  * @qid: Queue identifier to submit descriptors on.
  * @direction: true for host-to-device, false for device-to-host.
+ * @sequence_num: sequence number under async submission; 0 for sync.
  *
  *   DMA data between a user space virtual address range and a contiguous location in device memory.
  *   In order to do this, we need to know the physical pages are associated with
@@ -222,26 +225,25 @@ bool ndma_zerocopy_supported(void);
  *   We use pin_user_pages_fast() to reduce pinning overhead because we know the process can't go 
  *   away while we are down here doing our thing in the kernel within a single IOCTL call. 
  *   
- *   We ping pong back and forth between two dma contexts. So while dma for context A is in progress, 
- *   we are pinning pages and starting dmas for context B. 
- *
- *   Algorithm goes like this:
- *      initial a pair of dma contexts 
- *      prev dma ctx = null
+ *   ## For sync mode ##
+ *   We enqueue DMA contexts into a fixed-size queue and drive submission from that queue.
+ *   The loop:
  *      lock()
- *      while still more data remaining
- *         current dma ctx = next available context
- *         init current dma context
- *         calc size of the transfer for this dma context.  We want to transfer up to page boundaries
- *         calc number of pages that need to be pinned for this dma
- *         pin host pages in memory
- *         generate descriptors for 
- *         if prev dma ctx != NULL, wait for the prev dma to complete
- *         update host address, device address and ammount remaining
- *      wait for the last dma ctx to complete
+ *      while data remains
+ *         submit any pinned-but-unsubmitted ctxs when descriptors are available
+ *         create a new ctx when queue space and pin budget allow
+ *         pin pages immediately for the ctx
+ *         advance queue tail and update host/device pointers
+ *         wait on submitted ctxs from the head as needed to relieve pressure
+ *      submit remaining pinned ctxs
+ *      drain submitted ctxs from the head
  *      unlock()
- *      free resources
  *
+ *   ## For async mode ##
+ *   We keep submitting dma contexts until we hit a threshold of pinned pages. 
+ *   Once we hit the threshold, we stop pinning pages and set the mm_struct for remote pinning later.
+ *   TODO: liulily to add more detail once the complete async path is implemented.
+ * 
  *  Notes:
  *    unpinning responsibilities. Up until a dma is successfully launched, this routine is responsible for unpinning
  *    host memory.  After that ndma_zerocopy_wait_for_completion() owns responsibility for unpinning pages.
@@ -251,12 +253,13 @@ bool ndma_zerocopy_supported(void);
  *    process context.
  *
  */
-int ndma_memcpy_zerocopy(struct neuron_device *nd,
-			 u32 nc_id,
-			 const nrt_tensor_batch_op_t *ops,
-			 u32 num_ops,
-			 dma_addr_t dev_base,
-			 int qid,
-			 bool direction);
+int ndma_zerocopy_submit(struct neuron_device *nd,
+						u32 nc_id,
+						const nrt_tensor_batch_op_t *ops,
+						u32 num_ops,
+						dma_addr_t dev_base,
+						int qid,
+						bool direction,
+						u64 sequence_num);
 
 #endif

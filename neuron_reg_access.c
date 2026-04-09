@@ -7,7 +7,7 @@
 
 inline int reg_read32(const u32 __iomem *addr, u32 *value)
 {
-	return ndhal->ndhal_reg_access.reg_read32_array((void **)&addr, value, 1);
+	return ndhal->ndhal_fw_io.fw_io_read_csr_array((void **)&addr, value, 1, true);
 }
 
 inline void reg_write32(u32 __iomem *addr, u32 value)

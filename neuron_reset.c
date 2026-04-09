@@ -25,9 +25,13 @@ int no_reset = 0;
 module_param(no_reset, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 MODULE_PARM_DESC(no_reset, "Dont reset device");
 
+int reset_top_dma = 0;
+module_param(reset_top_dma, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+MODULE_PARM_DESC(reset_top_dma, "Reset top-level DMAs during TPB reset");
+
 #define NR_DEVICE_RESET_RETRY_INTERVAL  30000   // millisecond
 #define NR_TPB_RESET_RETRY_INTERVAL     10000   // millisecond
-
+#define NR_RESET_POLL_INTERVAL          100     // millisecond
 
 /**
  * ITER_COAL_REQS - iterate over coalesced reset requests
@@ -61,7 +65,7 @@ int nr_msleep_stoppable(struct neuron_device *nd, uint32_t msec)
 static int nr_call_post_reset_config(struct neuron_device *nd, uint32_t nc_map, bool reset_succeeded)
 {
 	if (nc_map == NEURON_NC_MAP_DEVICE) {
-		return ndhal->ndhal_reset.nr_post_reset_config(nd, reset_succeeded);
+		return ndhal->ndhal_reset.nr_post_reset_config(nd, reset_succeeded, no_reset);
 	}
 	return 0;
 }
@@ -94,7 +98,7 @@ static int nr_reset_thread_fn(void *arg)
 		if (first_request->request_id != NEURON_RESET_REQUEST_ALL && first_request->next != NULL) {
 			ITER_COAL_REQS(request_iter, first_request, last_request, {
 				coal_cnt++;
-				nc_map |= request_iter->nc_map; 
+				nc_map |= request_iter->nc_map;
 			})
 		} else {
 			last_request = first_request;
@@ -374,7 +378,7 @@ bool nr_op_in_reset_wnd(uint64_t op_start_time, struct neuron_device *nd)
 	return false;
 }
 
-int nr_initiate_reset_via_fw(struct neuron_device *nd, uint32_t nc_map, uint32_t tpb_reset_map)
+int nr_initiate_reset_via_fw(struct neuron_device *nd, uint32_t nc_map, uint32_t tpb_reset_map_lo, uint32_t tpb_reset_map_hi)
 {
 	bool is_device_reset;
 	uint32_t reset_retry_interval;
@@ -391,7 +395,7 @@ int nr_initiate_reset_via_fw(struct neuron_device *nd, uint32_t nc_map, uint32_t
 	start_time = ktime_get();
 
 	/* Send reset request to firmware */
-	fw_io_initiate_reset(nd->npdev.bar0, is_device_reset, tpb_reset_map);
+	fw_io_initiate_reset(nd->npdev.bar0, is_device_reset, tpb_reset_map_lo, tpb_reset_map_hi);
 	next_reset_retry_time = ktime_add_ms(start_time, reset_retry_interval);
 
 	do {
@@ -399,7 +403,7 @@ int nr_initiate_reset_via_fw(struct neuron_device *nd, uint32_t nc_map, uint32_t
 		 * After reset initiation, firmware becomes unresponsive until
 		 * the device completes the reset. Wait before next polling cycle.
 		 */
-		if (nr_msleep_stoppable(nd, ndhal->ndhal_reset.reset_poll_interval)) {
+		if (nr_msleep_stoppable(nd, NR_RESET_POLL_INTERVAL)) {
 			return -EINTR;
 		}
 
@@ -421,7 +425,7 @@ int nr_initiate_reset_via_fw(struct neuron_device *nd, uint32_t nc_map, uint32_t
 			 * If timed out, retry the reset.
 			 * This handles cases where the initial/previous reset was missed.
 			 */
-			fw_io_initiate_reset(nd->npdev.bar0, is_device_reset, tpb_reset_map);
+			fw_io_initiate_reset(nd->npdev.bar0, is_device_reset, tpb_reset_map_lo, tpb_reset_map_hi);
 
 			next_reset_retry_time = ktime_add_ms(cur_time, reset_retry_interval);
 		}

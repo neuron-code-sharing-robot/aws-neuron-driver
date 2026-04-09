@@ -157,13 +157,9 @@
 #include "../neuron_crwl.h"
 #include "neuron_pelect.h"
 
-int userver_pds_node_cnt = 2;
-module_param(userver_pds_node_cnt, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
-MODULE_PARM_DESC(userver_pds_node_cnt, "pds ultraserver node count");
-
-int userver_pds_server_id = 0x0001;
-module_param(userver_pds_server_id, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
-MODULE_PARM_DESC(userver_pds_server_id, "pds ultraserver id");
+int pds_reservation_id = 0x0001;
+module_param(pds_reservation_id, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+MODULE_PARM_DESC(pds_reservation_id, "pds reservation id");
 
 
 /* Enable ultraserver auto election (4 node configuration) by default  */
@@ -293,7 +289,7 @@ typedef struct pod_neighbor_io {
 	struct mem_chunk *data_mc;
 } pod_neighbor_io_t;
 
-static void npe_pds_spoof(void);
+static void npe_pds_config_init(void);
 
 static bool npe_pod_ctl_is_set(int value)
 {
@@ -1216,10 +1212,10 @@ int npe_election_exec_on_rst(struct neuron_device *nd, bool reset_successful)
 			goto done;
 	}
 	
-	// spoof PDS topology/election data
+	// initialize PDS configuration (topology/election) data
 	//
 	if (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_PDS) {
-		npe_pds_spoof();
+		npe_pds_config_init();
 		goto done;
 	}
 	
@@ -1271,6 +1267,11 @@ static bool npe_pod_state_busy(void)
 static int npe_get_modal_node_id(enum neuron_ultraserver_mode mode)
 {
 	int node_id = ndhal_pelect_data.node_id;
+
+	// PDS doesn't change node_id based on mode because nodes id are location based vs. election based
+	if (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_PDS) {
+		return node_id;
+	}
 
 	switch (mode) {
 		case NEURON_ULTRASERVER_MODE_UNSET:
@@ -1424,6 +1425,31 @@ static bool npe_mode_is_supported(enum neuron_ultraserver_mode mode)
 			break;
 	}
 	return false;
+}
+
+static enum neuron_ultraserver_mode npe_node_cnt_to_mode(int node_cnt)
+{
+	enum neuron_ultraserver_mode mode = NEURON_ULTRASERVER_MODE_UNSET;
+
+	switch (node_cnt) {
+		case 0:
+		case 1:
+			mode = NEURON_ULTRASERVER_MODE_X1;
+			break;
+		case 2:
+			if (npe_mode_is_supported(NEURON_ULTRASERVER_MODE_X2H)) {
+				mode = NEURON_ULTRASERVER_MODE_X2H;
+			} else if (npe_mode_is_supported(NEURON_ULTRASERVER_MODE_X2V)) {
+				mode = NEURON_ULTRASERVER_MODE_X2V;
+			}
+			break;
+		case 4:
+			mode = NEURON_ULTRASERVER_MODE_X4;
+			break;
+		default:
+			break;
+	}
+	return mode;
 }
 
 /**
@@ -1727,22 +1753,18 @@ static void npe_stop_thread(void)
 ssize_t npe_class_node_id_show_data(char *buf, u32 sz)
 {
 	int node_id;
-	enum neuron_ultraserver_mode mode = NEURON_ULTRASERVER_MODE_X1;
+	enum neuron_ultraserver_mode mode;
 
 	if (npe_pod_state_busy()) {
 		return dhal_sysfs_emit(buf, "busy\n");
 	}
 
-	if (sz == 4) {
-		mode = NEURON_ULTRASERVER_MODE_X4;
-	} else if (sz == 2) {
-		if (npe_mode_is_supported(NEURON_ULTRASERVER_MODE_X2H)) {
-			mode = NEURON_ULTRASERVER_MODE_X2H;
-		} else if (npe_mode_is_supported(NEURON_ULTRASERVER_MODE_X2V)) {
-			mode = NEURON_ULTRASERVER_MODE_X2V;
-		}
+	if (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_PDS) {
+		mode = npe_node_cnt_to_mode(ndhal_pelect_data.node_cnt);
+	} else if (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_ULTRASERVER) {
+		mode = npe_node_cnt_to_mode(sz);
 	} else {
-		pr_err("Unexpected class entry: node_id_%d", sz);
+		pr_err("unexpected platform type %d", ndhal->ndhal_arch.platform_type);
 		return dhal_sysfs_emit(buf, "invalid\n");
 	}
 
@@ -1750,6 +1772,23 @@ ssize_t npe_class_node_id_show_data(char *buf, u32 sz)
 	return dhal_sysfs_emit(buf, "%d\n", node_id);
 }
 
+ssize_t npe_class_node_cnt_show_data(char *buf)
+{
+	int node_cnt = -1; // node_cnt is currently only returned for PDS
+
+	if (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_PDS) {
+		node_cnt = ndhal_pelect_data.node_cnt;
+	}
+
+	return dhal_sysfs_emit(buf, "%d\n", node_cnt);
+}
+
+/**
+ * npe_class_server_id_show_data()
+ *
+ *   return server id data for sysfs class node.  PD and PDS
+ *   have different server id data retrieval methodologies.
+ */
 ssize_t npe_class_server_id_show_data(char *buf, u32 sz)
 {
 	u64 pod_serial_number;
@@ -1759,18 +1798,12 @@ ssize_t npe_class_server_id_show_data(char *buf, u32 sz)
 		return dhal_sysfs_emit(buf, "0000000000000000\n");
 	}
 
-	if (sz == 4) {
-		mode = NEURON_ULTRASERVER_MODE_X4;
-	} else if (sz == 2) {
-		if (npe_mode_is_supported(NEURON_ULTRASERVER_MODE_X2H)) {
-			mode = NEURON_ULTRASERVER_MODE_X2H;
-		} else if (npe_mode_is_supported(NEURON_ULTRASERVER_MODE_X2V)) {
-			mode = NEURON_ULTRASERVER_MODE_X2V;
-		}
-	} else {
-		pr_err("Unexpected class entry: server_id_%d", sz);
-		return dhal_sysfs_emit(buf, "invalid\n");
+	if (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_PDS) {
+		mode = npe_node_cnt_to_mode(ndhal_pelect_data.node_cnt);
+	} else if (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_ULTRASERVER) {
+		mode = npe_node_cnt_to_mode(sz);
 	}
+
 	pod_serial_number = npe_get_modal_serial_number(mode);
 
 	return dhal_sysfs_emit(buf, "%016llx\n", pod_serial_number);
@@ -1811,40 +1844,34 @@ struct {
 	uint64_t d0_serial_number; // serial number of a particular device 0 on a particular server
 	uint64_t server_num;       // server unique id of the associated server
 	uint32_t node_id;          // (rack id<<1 | server id)
+	uint32_t node_cnt;         // ultra-server nodes size.
 } npe_pds_tmp_mapping_tbl[] =  {
-	{0x644b8499cd7bf298ull, 0x0000004005590701ull, 0},
-	{0x001e8649a094af56ull, 0x0000004005590701ull, 1},
-	{0x4b63b0678ae2a930ull, 0x0000004005590701ull, 2},
-	{0x7242db0306415ed7ull, 0x0000004005590701ull, 3},
-	{0x7e3a518befdf7a57ull, 0x0000004005590689ull, 0},
-	{0x3c604484897a4f1aull, 0x0000004005590689ull, 1},
-	{0xacfba8515bb626a6ull, 0x0000004005590689ull, 2},
-	{0x48c2b73699e97cadull, 0x0000004005590689ull, 3},
-	{0xa952ff53b45fc298ull, 0x0000004005590680ull, 0},
-	{0x5961a8d75d827fc0ull, 0x0000004005590680ull, 1},
-	{0x714cf1792facf83bull, 0x0000004005590680ull, 2},
-	{0x9b3187e1756c8a7full, 0x0000004005590680ull, 3},
-	{0x85059f2db248f3dfull, 0x0000004005590682ull, 0},
-	{0xf4d2ef81ad1b1264ull, 0x0000004005590682ull, 1},
-	{0x3d3ea5a61b768cbdull, 0x0000004005590682ull, 2},
-	{0x85752a544054033aull, 0x0000004005590682ull, 3}
+    {0xf15812e4f3dc642cull, 0x0000004005590728ull, 0, 4}, //TRN3PDS US16 Node-1 Label swapped.
+    {0x51f84556b473ea1cull, 0x0000004005590728ull, 1, 4}, //TRN3PDS US16 Node-0 Label swapped.
+    {0xdd5da7090e13c984ull, 0x0000004005590728ull, 3, 4}, //TRN3PDS US16 Flipped the server_id(0) in rack1
+    {0x2c82d5db4d1c3969ull, 0x0000004005590728ull, 2, 4}, //TRN3PDS US16 Flipped the server_id(1) in rack1
 }; 
 
-/* npe_pds_spoof(void)
+/* npe_pds_config_init(void)
  *
- *   temp spoof of PDS platform data
+ *   Initialize pds configuration data.  Configuration data consists of:
+ *    - reservation_id - unique id indentifying all the instances belonging to this PDS reservation
+ *    - node_id        - node id for this node in the PDS server
+ *    - node_cnt       - count of nodes in the PDS server
  *
  */
-static void npe_pds_spoof(void)
+static void npe_pds_config_init(void)
 {
 	static bool initialized = false;
-	int ret;
+	int ret = 0;
 	int i;
 	struct neuron_device *nd;
 	uint64_t serial_number;
+	int instance_sz;
+	int partition_sz;
+	int server_id; 
+	int rack_id;
 
-	pr_info("spoofing pds data");
-	
 	if (initialized) {
 		return;
 	}
@@ -1857,42 +1884,87 @@ static void npe_pds_spoof(void)
 		return;
 	}
 
+	// TODO remove temp mapping table logic
+	//
 	ret = fw_io_serial_number_read(nd->npdev.bar0, &serial_number);
 	if (ret) {
 		pr_err("nd%02d: local serial number read failed", nd->device_index);
 		return;
 	}
 
+	// check temporary mapping table for PDS server data
+	//
 	for (i = 0; i < sizeof(npe_pds_tmp_mapping_tbl) / sizeof(*npe_pds_tmp_mapping_tbl); i++) {
 		if (serial_number == npe_pds_tmp_mapping_tbl[i].d0_serial_number) {
-			ndhal_pelect_data.node_cnt = 4;
 			ndhal_pelect_data.node_id = npe_pds_tmp_mapping_tbl[i].node_id;
 			ndhal_pelect_data.pod_serial_num = npe_pds_tmp_mapping_tbl[i].server_num;
+			ndhal_pelect_data.node_cnt = npe_pds_tmp_mapping_tbl[i].node_cnt;
 			goto done;
 		}
 	}
 
-	// otherwise, we use temporary parameter overrides  
+	// get PDS platform data (instance and partition size) to determine node cnt
 	//
-	ndhal_pelect_data.node_cnt = userver_pds_node_cnt;
+	ret = fw_io_instance_partition_sz_read(nd->npdev.bar0, &instance_sz, &partition_sz);
+	if (ret) {
+		goto done;
+	} 
 
-	if (ndhal_pelect_data.node_cnt == 0) {
-		ndhal_pelect_data.node_id = -1;
-	} else if (ndhal_pelect_data.node_cnt == 2) {
-		// node_cnt of 2 uses V-links
-		ndhal_pelect_data.lr_mask = 0x1;
-		ndhal_pelect_data.node_id = ndhal->ndhal_arch.server_id;
-	} else if (ndhal_pelect_data.node_cnt == 4) {
-		// TODO PDS add in rack id
-		ndhal_pelect_data.node_id = ndhal->ndhal_arch.server_id; 
+	if ((partition_sz == -1) || (instance_sz <= 0)) {
+		pr_warn("PDS partition/instance size data is invalid (%d/%d), defaulting to 4 node PDS configuration", partition_sz,  instance_sz);
+		ndhal_pelect_data.node_cnt = 4;
 	} else {
-		ndhal_pelect_data.node_cnt = 0;
-		pr_err("invalid PDS node count of %d", ndhal_pelect_data.node_cnt);
+		ndhal_pelect_data.node_cnt = partition_sz / instance_sz;
 	}
 
-	ndhal_pelect_data.pod_serial_num = userver_pds_server_id;
+	if (ndhal_pelect_data.node_cnt == 2) {
+		// node_cnt of 2 uses V-links (for mode selection)
+		ndhal_pelect_data.lr_mask = 0x1;
+	}
+
+	// get PDS reservation id
+	//
+	ret = fw_io_reservation_id_read(nd->npdev.bar0, &ndhal_pelect_data.pod_serial_num);
+	if (ret) {
+		goto done;
+	}
+
+	if (ndhal_pelect_data.pod_serial_num == 0) {
+		pr_warn("PDS server reservation id invalid (%llu), defaulting to 'pds_reservation_id' parameter value: %u", ndhal_pelect_data.pod_serial_num, pds_reservation_id);
+		ndhal_pelect_data.pod_serial_num = pds_reservation_id;
+	}
+
+	// get PDS server id and rack id
+	//
+	ret = fw_io_server_info_read(nd->npdev.bar0, &server_id, &rack_id);
+	if (ret || (server_id == -1) || (rack_id == -1)) {
+		pr_warn("Unable to retrieve PDS server server/rack ids, making best effort guess");
+		server_id = (server_id == -1) ? 0 : server_id;
+		rack_id = (rack_id == -1) ? 0 : rack_id;
+	}
+
+	// map server/rack to node id.  TODO covert to mapping function
+	//
+	switch ((rack_id << 1) | server_id) {
+		case 0:
+			ndhal_pelect_data.node_id = 0;
+			break;
+		case 1:
+			ndhal_pelect_data.node_id = 1;
+			break;
+		case 2:
+			ndhal_pelect_data.node_id = 3;
+			break;
+		case 3:
+			ndhal_pelect_data.node_id = 2;
+			break;
+		default:
+			ndhal_pelect_data.node_id = -1;
+			break;
+	}
 
 done:
+	// TODO - correctly report topology discovery/election failure once interfaces become more mature
 	ndhal_pelect_data.pod_state_internal = NEURON_NPE_POD_ST_ELECTION_SUCCESS;
 	
 	initialized = true;

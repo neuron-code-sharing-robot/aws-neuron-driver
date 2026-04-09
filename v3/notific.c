@@ -9,8 +9,6 @@
 
 #include "notific.h"
 
-#define NOTIFIC_NQ_HEAD_OFFSET 0x10c
-
 static u64 get_sdma_misc_base(int nc_id, int eng_id)
 {
 	int seng_id = nc_id / V3_NC_PER_SENG;

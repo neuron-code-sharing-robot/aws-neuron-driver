@@ -93,6 +93,13 @@ int npe_pod_ctrl(struct neuron_device *nd, u32 ctrl, enum neuron_ultraserver_mod
 ssize_t npe_class_node_id_show_data(char *buf, u32 sz);
 
 /**
+ * npe_class_node_cnt_show_data() - return sysfs class node_cnt
+ *
+ * @buf:		    sysfs buffer
+ */
+ssize_t npe_class_node_cnt_show_data(char *buf);
+
+/**
  * npe_class_server_id_show_data() - return sysfs class server_id
  *
  * @buf:		    sysfs buffer

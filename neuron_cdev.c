@@ -1233,7 +1233,7 @@ static int ncdev_mem_buf_zerocopy64(struct neuron_device *nd, unsigned int cmd, 
 		op.buffer = buffer;
 		op.size = size;
 
-		ret = ndma_memcpy_zerocopy(nd, nc_id, &op, 1, dev_base, qid, copy_to_mem_handle ? true : false);
+		ret = ndma_zerocopy_submit(nd, nc_id, &op, 1, dev_base, qid, copy_to_mem_handle ? true : false, 0);
 	}
 
 	return ret;
@@ -1409,7 +1409,7 @@ static int ncdev_mem_buf_zerocopy64_batch(struct neuron_device *nd, void *param)
 			}
 
 			// use the zero-copy batch function for ops within a single batch
-			ret = ndma_memcpy_zerocopy(nd, nc_id, batch->ops_ptr, batch->num_ops, dev_base, qid, arg.is_copy_to_device);
+			ret = ndma_zerocopy_submit(nd, nc_id, batch->ops_ptr, batch->num_ops, dev_base, qid, arg.is_copy_to_device, arg.sequence_num);
 			if (ret) {
 				pr_err("batch zero-copy DMA failed on batch %d on nd%02d: %d\n", i, nd->device_index, ret);
 				goto cleanup;
@@ -1502,7 +1502,7 @@ static long ncdev_bar_read(struct neuron_device *nd, u8 bar, u64 *reg_addresses,
 		if (data == NULL)
 			return -ENOMEM;
 
-		ret = ndhal->ndhal_reg_access.reg_read32_array((void **)reg_addresses, data, data_count);
+		ret = ndhal->ndhal_fw_io.fw_io_read_csr_array((void **)reg_addresses, data, data_count, true);
 		if (ret) {
 			kfree(data);
 			return ret;
@@ -2933,7 +2933,7 @@ static int ncdev_h2t_dma_alloc_queues(struct neuron_device *nd, unsigned int cmd
 		return -E2BIG;
 	}
 	
-	if (arg.copy_queue_cnt + arg.service_queue_cnt >= DMA_MAX_Q_MAX) {
+	if (arg.copy_queue_cnt + arg.service_queue_cnt >= ndhal->ndhal_udma.num_queues) {
 		pr_err("nd%02d: invalid total queue count %d provided", nd->device_index, arg.copy_queue_cnt + arg.service_queue_cnt);
 		return -E2BIG;
 	}
@@ -2964,7 +2964,7 @@ static int ncdev_h2t_dma_alloc_queues(struct neuron_device *nd, unsigned int cmd
 done:
 	if (ret) {
 		u32 combined_queue_bmap = arg.copy_queue_bmap | arg.service_queue_bmap;
-		for (i=0; i < DMA_MAX_Q_V4; i++) {
+		for (i=0; i < ndhal->ndhal_udma.num_queues; i++) {
 			if ((1<<i) & combined_queue_bmap) {
 				ndmar_h2t_ring_release(nd, arg.nc_id, i);
 			}
@@ -2990,7 +2990,7 @@ static int ncdev_h2t_dma_free_queues(struct neuron_device *nd, unsigned int cmd,
 		return -E2BIG;
 	}
 	
-	for (i=0; i < DMA_MAX_Q_V4; i++) {
+	for (i=0; i < ndhal->ndhal_udma.num_queues; i++) {
 		int lret;
 		if ((1<<i) & arg.queue_bmap) {
 			lret = ndmar_h2t_ring_release(nd, arg.nc_id, i);
@@ -3019,6 +3019,46 @@ static int ncdev_power_profile_set(struct neuron_device *nd, void *param)
 	}
 	return ndhal->ndhal_perf.perf_set_profile(nd, arg.profile);
 }
+
+static int ncdev_power_profile_get(struct neuron_device *nd, void *param)
+{
+	struct neuron_ioctl_power_profile arg;
+	int ret;
+
+	ret = neuron_copy_from_user(__func__, &arg, (struct neuron_ioctl_power_profile*) param, sizeof(arg));
+	if (ret)
+		return ret;
+
+	if (arg.sz != sizeof(arg)) {
+		return -ENXIO;
+	}
+	if (arg.ctrl != 1) {
+		return -ENOTSUPP;
+	}
+	
+	ret = ndhal->ndhal_perf.perf_get_profile(nd, &arg.profile);
+	if (ret)
+		return ret;
+	
+	return copy_to_user(param, &arg, sizeof(arg));
+}
+
+static int ncdev_available_perf_profiles(struct neuron_device *nd, void *param)
+{
+	struct neuron_ioctl_available_perf_profiles arg;
+	int ret;
+
+	ret = neuron_copy_from_user(__func__, &arg, (struct neuron_ioctl_available_perf_profiles*) param, sizeof(arg));
+	if (ret)
+		return ret;
+
+	ret = ndhal->ndhal_perf.perf_get_supported_profiles(nd, arg.requested_feature, &arg.num_profiles, arg.bitmap);
+	if (ret)
+		return ret;
+
+	return copy_to_user(param, &arg, sizeof(arg));
+}
+
 
 static int ncdev_throttling_notifications_set(struct neuron_device *nd, void *param)
 {
@@ -3050,6 +3090,57 @@ static int ncdev_get_va_placement(void *param)
 		arg.hbm_index = -1;
 	} 
 	unused = copy_to_user(param, &arg, sizeof(arg));
+	return ret;
+}
+
+static int ncdev_get_async_h2d_dma_compl_queues(struct neuron_device *nd, void *param)
+{
+	int ret = 0;
+	u32 qid = 0;
+	int eng_id = 0;
+	struct neuron_ioctl_get_async_h2t_dma_compl_queues arg;
+
+	ret = neuron_copy_from_user(__func__, 
+								&arg,
+								(struct neuron_ioctl_get_async_h2t_dma_compl_queues *)param,
+								sizeof(arg));
+	if (ret) {
+		return ret;
+	}
+
+	/* TODO: start h2d kernel thread */
+
+	if (arg.nc_id >= ndhal->ndhal_address_map.nc_per_device) {
+		pr_err("nd%02d: invalid nc %u provided\n", nd->device_index, arg.nc_id);
+		return -EINVAL;
+	}
+
+	memset(arg.compl_queue_info, 0, sizeof(arg.compl_queue_info));
+
+	eng_id = ndhal->ndhal_ndmar.ndmar_get_h2t_eng_id(nd, arg.nc_id);
+
+	for (qid = 0; qid < DMA_MAX_Q_MAX; qid++) {
+		if (!(arg.qid_bitmap & (1u << qid))) {
+			continue;
+		}
+
+		struct ndma_ring *ring = &nd->ndma_engine[eng_id].queues[qid].ring_info;
+		struct ndma_h2d_compl_queue *compl_queue = &ring->dma_compl_queue;
+		struct mem_chunk *mc = compl_queue->mc;
+
+		if (!mc) {
+			pr_err("nd%02d: invalid h2d qid %u; compl queue not initialized\n",
+			       nd->device_index, qid);
+			return -EINVAL;
+		}
+
+		arg.compl_queue_info[qid].mmap_offset = nmmap_offset(mc);
+		arg.compl_queue_info[qid].mmap_size = sizeof(neuron_h2d_dma_compl_queue_t) +
+			((compl_queue->capacity_mask + 1) * sizeof(neuron_h2d_dma_compl_queue_entry_t));
+	}
+
+	ret = copy_to_user(param, &arg, sizeof(arg));
+
 	return ret;
 }
 
@@ -3282,8 +3373,14 @@ static long ncdev_ioctl(struct file *filep, unsigned int cmd, unsigned long para
 		return ncdev_h2t_dma_free_queues(nd, cmd, (void*)param);
 	} else if (cmd == NEURON_IOCTL_POWER_PROFILE) {
 		return ncdev_power_profile_set(nd, (void*)param);
+	} else if (cmd == NEURON_IOCTL_GET_PERFORMANCE_PROFILE) {
+		return ncdev_power_profile_get(nd, (void*)param);
 	} else if (cmd == NEURON_IOCTL_THROTTLING_NOTIFICATIONS) {
 		return ncdev_throttling_notifications_set(nd, (void*)param);
+	} else if (cmd == NEURON_IOCTL_AVAILABLE_PERF_PROFILES) {
+		return ncdev_available_perf_profiles(nd, (void*)param);
+	} else if (cmd == NEURON_IOCTL_GET_ASYNC_H2T_DMA_COMPL_QUEUES) {
+		return ncdev_get_async_h2d_dma_compl_queues(nd, (void*)param);
 	}
 
 	// B/W compatibility
@@ -3373,8 +3470,6 @@ static int ncdev_flush(struct file *filep, fl_owner_t id)
 	if (attach_cnt == 1) {
 		// If this proc exited in the middle of a reset, wait for the reset to be processed.
 		nr_wait(nd, task_tgid_nr(current), true);
-
-		ndhal->ndhal_cdev.ncdev_quiesce_exec_on_proc_exit();
 
 		ndmar_handle_process_exit(nd, task_tgid_nr(current));
 		msleep(10); // TODO - confirm with HW dev, whether any delay needed after q reset.
@@ -3517,11 +3612,26 @@ static ssize_t neuron_connected_devices_show(struct device *dev, struct device_a
 
 static DEVICE_ATTR(connected_devices, S_IRUSR, neuron_connected_devices_show, NULL);
 
+static ssize_t fw_api_version_show(struct device *dev, struct device_attribute *attr, char *buf)
+{	int fw_api_version;
+	int minor = MINOR(dev->devt);
+	struct neuron_device *nd = devnodes[minor].ndev;
+
+	fw_io_api_version_read(nd->npdev.bar0, &fw_api_version);
+	if (fw_api_version == 0xdeadbeef) { // the value is not readable during reset, try later
+		return sprintf(buf, "busy\n");
+	}
+	return sprintf(buf, "%u\n", fw_api_version);
+}
+
+static DEVICE_ATTR(fw_api_version, S_IRUGO, fw_api_version_show, NULL);
+
 static struct attribute *attrs[] = {
 	&dev_attr_reset.attr,
 	&dev_attr_core_count.attr,
 	&dev_attr_connected_devices.attr,
-   	NULL,
+	&dev_attr_fw_api_version.attr,
+	NULL,
 };
 
 static struct attribute_group attr_group = {
@@ -3620,14 +3730,22 @@ int ncdev_delete_device_node(struct neuron_device *ndev)
 
 /*
  * neuron_device class sysfs nodes
- *   node_id_2/4
- *   node_cnt_2/4
- *   server_id_2/4
+ *   ULTRASERVER
+ *      node_id_2/4
+ *      server_id_2/4
+ *      ultraserver_mode
+ *
+ *   PDS
+ *      node_id
+ *      node_cnt
+ *      reservation_id
+ *      ultraserver_mode
  *
  */
 
 struct ncdev_class_attr {
 	struct class_attribute attr;
+	enum neuron_platform_type platform_type;
 	u32 info;
 };
 
@@ -3650,6 +3768,24 @@ static ssize_t ncdev_class_node_id_show(struct class *class, struct class_attrib
 }
 
 #if (!defined(RHEL_RELEASE_CODE) && (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))) || (defined(RHEL_RELEASE_CODE) && (RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9, 5)))
+static ssize_t ncdev_class_node_cnt_show(const struct class *class, const struct class_attribute *attr, char *buf)
+#else
+static ssize_t ncdev_class_node_cnt_show(struct class *class, struct class_attribute *attr, char *buf)
+#endif
+{
+	//struct ncdev_class_attr *ca = container_of(attr, struct ncdev_class_attr, attr); 
+
+	// protect against ndhal initialization race
+	if (ndhal == NULL) {
+		return 0;
+	}
+	if (ndhal->ndhal_npe.npe_class_node_cnt_show_data == NULL) {
+		return 0;
+	}
+	return ndhal->ndhal_npe.npe_class_node_cnt_show_data(buf);
+}
+
+#if (!defined(RHEL_RELEASE_CODE) && (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))) || (defined(RHEL_RELEASE_CODE) && (RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9, 5)))
 static ssize_t ncdev_class_server_id_show(const struct class *class, const struct class_attribute *attr, char *buf)
 #else
 static ssize_t ncdev_class_server_id_show(struct class *class, struct class_attribute *attr, char *buf)
@@ -3667,6 +3803,23 @@ static ssize_t ncdev_class_server_id_show(struct class *class, struct class_attr
 	return ndhal->ndhal_npe.npe_class_server_id_show_data(buf, ca->info);
 }
 
+#if (!defined(RHEL_RELEASE_CODE) && (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))) || (defined(RHEL_RELEASE_CODE) && (RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9, 5)))
+static ssize_t ncdev_class_reservation_id_show(const struct class *class, const struct class_attribute *attr, char *buf)
+#else
+static ssize_t ncdev_class_reservation_id_show(struct class *class, struct class_attribute *attr, char *buf)
+#endif
+{
+	struct ncdev_class_attr *ca = container_of(attr, struct ncdev_class_attr, attr); 
+
+	// protect against ndhal initialization race
+	if (ndhal == NULL) {
+		return 0;
+	}
+	if (ndhal->ndhal_npe.npe_class_server_id_show_data == NULL) {
+		return 0;
+	}
+	return ndhal->ndhal_npe.npe_class_server_id_show_data(buf, ca->info);
+}
 
 #if (!defined(RHEL_RELEASE_CODE) && (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))) || (defined(RHEL_RELEASE_CODE) && (RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9, 5)))
 static ssize_t ncdev_class_ultraserver_mode_show(const struct class *class, const struct class_attribute *attr, char *buf)
@@ -3684,15 +3837,74 @@ static ssize_t ncdev_class_ultraserver_mode_show(struct class *class, struct cla
 	return ndhal->ndhal_npe.npe_class_ultraserver_mode_show_data(buf);
 }
 
-#define NCDEV_CLASS_ATTR(name, f, i) \
-	{__ATTR(name, S_IRUGO, f, NULL), i} 
+#if (!defined(RHEL_RELEASE_CODE) && (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))) || (defined(RHEL_RELEASE_CODE) && (RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9, 5)))
+static ssize_t ncdev_class_hbm_7200_show(const struct class *class, const struct class_attribute *attr, char *buf)
+#else
+static ssize_t ncdev_class_hbm_7200_show(struct class *class, struct class_attribute *attr, char *buf)
+#endif
+{
+	int i;
+	int supports_hbm_7200 = 1;
+	if (total_neuron_devices == 0) {
+		return dhal_sysfs_emit(buf, "busy\n");
+	}
+
+	for (i = 0; i < total_neuron_devices; i++) {
+		if (neuron_devices[i]->supports_hbm_7200 == -1) {
+			return dhal_sysfs_emit(buf, "busy\n");
+		}
+		supports_hbm_7200 = supports_hbm_7200 & neuron_devices[i]->supports_hbm_7200;
+	}
+
+	return dhal_sysfs_emit(buf, "%d\n", (supports_hbm_7200) ? 1 : 0);
+}
+
+#if (!defined(RHEL_RELEASE_CODE) && (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))) || (defined(RHEL_RELEASE_CODE) && (RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9, 5)))
+static ssize_t ncdev_class_cur_perf_profile_show(const struct class *class, const struct class_attribute *attr, char *buf)
+#else
+static ssize_t ncdev_class_cur_perf_profile_show(struct class *class, struct class_attribute *attr, char *buf)
+#endif
+{
+	int i;
+	int cur_perf_profile;
+	if (total_neuron_devices == 0) {
+		return dhal_sysfs_emit(buf, "busy\n");
+	}
+
+	cur_perf_profile = neuron_devices[0]->current_perf_profile;
+	for (i = 1; i < total_neuron_devices; i++) {
+		if (neuron_devices[i]->current_perf_profile != cur_perf_profile) {
+			return dhal_sysfs_emit(buf, "-1\n");
+		}
+	}
+	return dhal_sysfs_emit(buf, "%d\n", cur_perf_profile);
+}
+
+#define NCDEV_CLASS_ATTR(name, f, p, i) \
+	{__ATTR(name, S_IRUGO, f, NULL), p, i} 
 
 static const struct ncdev_class_attr ncdev_class_attrs[] = {
-	NCDEV_CLASS_ATTR(node_id_2, ncdev_class_node_id_show, 2),
-	NCDEV_CLASS_ATTR(node_id_4, ncdev_class_node_id_show, 4),
-	NCDEV_CLASS_ATTR(server_id_2, ncdev_class_server_id_show, 2),
-	NCDEV_CLASS_ATTR(server_id_4, ncdev_class_server_id_show, 4),
-	NCDEV_CLASS_ATTR(ultraserver_mode, ncdev_class_ultraserver_mode_show, 0)
+	NCDEV_CLASS_ATTR(hbm_7200_capable, ncdev_class_hbm_7200_show, NEURON_PLATFORM_TYPE_STD, 0),
+	NCDEV_CLASS_ATTR(current_perf_profile, ncdev_class_cur_perf_profile_show, NEURON_PLATFORM_TYPE_STD, 0),
+};
+
+static const struct ncdev_class_attr ncdev_class_attrs_us[] = {
+	NCDEV_CLASS_ATTR(node_id_2, ncdev_class_node_id_show, NEURON_PLATFORM_TYPE_ULTRASERVER, 2),
+	NCDEV_CLASS_ATTR(node_id_4, ncdev_class_node_id_show, NEURON_PLATFORM_TYPE_ULTRASERVER, 4),
+	NCDEV_CLASS_ATTR(server_id_2, ncdev_class_server_id_show, NEURON_PLATFORM_TYPE_ULTRASERVER, 2),
+	NCDEV_CLASS_ATTR(server_id_4, ncdev_class_server_id_show, NEURON_PLATFORM_TYPE_ULTRASERVER, 4),
+	NCDEV_CLASS_ATTR(ultraserver_mode, ncdev_class_ultraserver_mode_show, NEURON_PLATFORM_TYPE_ULTRASERVER, 0),
+	NCDEV_CLASS_ATTR(hbm_7200_capable, ncdev_class_hbm_7200_show, NEURON_PLATFORM_TYPE_STD, 0),
+	NCDEV_CLASS_ATTR(current_perf_profile, ncdev_class_cur_perf_profile_show, NEURON_PLATFORM_TYPE_STD, 0),
+};
+
+static const struct ncdev_class_attr ncdev_class_attrs_pds[] = {
+	NCDEV_CLASS_ATTR(node_id, ncdev_class_node_id_show, NEURON_PLATFORM_TYPE_PDS, 0),
+	NCDEV_CLASS_ATTR(node_cnt, ncdev_class_node_cnt_show, NEURON_PLATFORM_TYPE_PDS, 0),
+	NCDEV_CLASS_ATTR(reservation_id, ncdev_class_reservation_id_show, NEURON_PLATFORM_TYPE_PDS, 0),
+	NCDEV_CLASS_ATTR(ultraserver_mode, ncdev_class_ultraserver_mode_show, NEURON_PLATFORM_TYPE_PDS, 0),
+	NCDEV_CLASS_ATTR(hbm_7200_capable, ncdev_class_hbm_7200_show, NEURON_PLATFORM_TYPE_STD, 0),
+	NCDEV_CLASS_ATTR(current_perf_profile, ncdev_class_cur_perf_profile_show, NEURON_PLATFORM_TYPE_STD, 0),
 };
 
 static const struct class_attribute class_attr_node_id =
@@ -3704,6 +3916,79 @@ static const struct class_attribute class_attr_server_id =
 static const struct class_attribute class_attr_ultraserver_mode =
 	__ATTR(ultraserver_mode, S_IRUGO, ncdev_class_ultraserver_mode_show, NULL);
 
+// per platform class attributes. TODO we may eventually want to split this out into a neuron_platform.c
+//
+static const struct { 
+		const struct ncdev_class_attr *class_attrs;
+		int class_attrs_cnt;
+		enum neuron_platform_type platform_type;
+	} ncdev_platform_class_attrs[] = {
+		{ncdev_class_attrs,		sizeof(ncdev_class_attrs) 	  / sizeof(*ncdev_class_attrs), NEURON_PLATFORM_TYPE_STD},
+		{ncdev_class_attrs_us,	sizeof(ncdev_class_attrs_us)  / sizeof(*ncdev_class_attrs_us), NEURON_PLATFORM_TYPE_ULTRASERVER},
+		{ncdev_class_attrs_pds,	sizeof(ncdev_class_attrs_pds) / sizeof(*ncdev_class_attrs_pds), NEURON_PLATFORM_TYPE_PDS},
+		{NULL, 				0, NEURON_PLATFORM_TYPE_INVALID}};
+
+int ncdev_class_attr_init(void)
+{
+	int i;
+	int ret;
+
+	if (neuron_dev_class) {
+		const struct ncdev_class_attr *class_attrs = NULL;
+		int class_attrs_cnt;
+
+		for (i = 0; i < sizeof(ncdev_platform_class_attrs) / sizeof(*ncdev_platform_class_attrs); i++) {
+			if (ncdev_platform_class_attrs[i].platform_type == ndhal->ndhal_arch.platform_type) {
+					class_attrs = ncdev_platform_class_attrs[i].class_attrs;
+					class_attrs_cnt = ncdev_platform_class_attrs[i].class_attrs_cnt;
+			}
+		}
+
+		// no class attributes for this platform type
+		if (class_attrs == NULL) {
+			return 0;
+		}
+
+		for (i = 0; i < class_attrs_cnt; i++) {
+			ret  = class_create_file(neuron_dev_class, &class_attrs[i].attr);
+			if (ret) {
+				pr_err("create class/%s failed", class_attrs[i].attr.attr.name);
+				goto fail;
+			}
+		}
+	}
+	return 0;
+
+fail:
+	return ret;
+}
+
+void ncdev_class_attr_cleanup(void)
+{
+	int i;
+
+	if (neuron_dev_class) {
+		const struct ncdev_class_attr *class_attrs = NULL;
+		int class_attrs_cnt;
+
+		for (i = 0; i < sizeof(ncdev_platform_class_attrs) / sizeof(*ncdev_platform_class_attrs); i++) {
+			if (ncdev_platform_class_attrs[i].platform_type == ndhal->ndhal_arch.platform_type) {
+					class_attrs = ncdev_platform_class_attrs[i].class_attrs;
+					class_attrs_cnt = ncdev_platform_class_attrs[i].class_attrs_cnt;
+			}
+		}
+
+		// no class attributes for this platform type
+		if (class_attrs == NULL) {
+			return;
+		}
+
+		for (i = 0; i < class_attrs_cnt; i++) {
+			class_remove_file(neuron_dev_class, &class_attrs[i].attr);
+		}
+	}
+}
+
 static void ncdev_cleanup(void)
 {
 	int i;
@@ -3713,9 +3998,6 @@ static void ncdev_cleanup(void)
 	}
 
 	if (neuron_dev_class) {
-		for (i = 0; i < sizeof(ncdev_class_attrs) / sizeof(*ncdev_class_attrs); i++) {
-			class_remove_file(neuron_dev_class, &ncdev_class_attrs[i].attr);
-		}
 		class_destroy(neuron_dev_class);
 	}
 
@@ -3748,13 +4030,6 @@ int ncdev_module_init(void)
 		goto fail;
 	}
 
-	for (i = 0; i < sizeof(ncdev_class_attrs) / sizeof(*ncdev_class_attrs); i++) {
-		ret  = class_create_file(neuron_dev_class, &ncdev_class_attrs[i].attr);
-		if (ret) {
-			pr_err("create class/%s failed", ncdev_class_attrs[i].attr.attr.name);
-			goto fail;
-		}
-	}
 	return ret;
 
 fail:

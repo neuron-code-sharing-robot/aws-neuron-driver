@@ -203,7 +203,7 @@ static void npower_calculate_stats(struct neuron_power_samples *current_samples,
 			min_power_to_log = current_samples->max_power_bips;
 		}
 		if (power_enabled_in_fw) {
-			pr_info("Not enough data to aggregate stats.  Have %u data points, min of %u max of %u, total of %llu.",
+			pr_debug("Not enough data to aggregate stats.  Have %u data points, min of %u max of %u, total of %llu.",
 				current_samples->num_data_points, min_power_to_log,
 				current_samples->max_power_bips,
 				current_samples->total_power_util_bips);

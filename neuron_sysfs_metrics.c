@@ -389,7 +389,7 @@ static ssize_t nsysfsmetric_show_nrt_other_metrics(struct nsysfsmetric_metrics *
         char buffer[256];
         int ret = ndhal->ndhal_tpb.pe_format_activity_stats(nd, attr->nc_id, buffer, sizeof(buffer));
         if (ret) {
-            pr_err("sysfs failed to read pe_array activity counters, error = %d\n", ret);
+            pr_err_ratelimited("sysfs failed to read pe_array activity counters, error = %d\n", ret);
         }
         len = nsysfsmetric_sysfs_emit(buf, "%s", buffer);
     } else {
@@ -942,7 +942,6 @@ int nsysfsmetric_register(struct neuron_device *nd, struct kobject *neuron_devic
     }
 
     // neuron{0, 1, ...}/stats/power
-    pr_info("Installing neuron power sysfs node\n");
     struct nsysfsmetric_node *power_node =
             nsysfsmetric_init_and_add_one_node(metrics, stats_node, "power", false, -1,
                                                power_utilization_attrs_info_tbl_cnt,

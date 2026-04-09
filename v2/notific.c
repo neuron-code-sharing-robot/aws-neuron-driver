@@ -9,9 +9,6 @@
 
 #include "notific.h"
 
-#define NOTIFIC_NQ_SIZE 0x28   // total size of the NQ register space
-#define NOTIFIC_NQ_HEAD_OFFSET 0x10c
-
 static u64 seng_sdma_base[V2_MMAP_TPB_COUNT][V2_NUM_DMA_ENGINES_PER_TPB] = {
 	{ V2_APB_SENG_0_SDMA_0_BASE, V2_APB_SENG_0_SDMA_1_BASE, V2_APB_SENG_0_SDMA_2_BASE,
 		V2_APB_SENG_0_SDMA_3_BASE, V2_APB_SENG_0_SDMA_4_BASE, V2_APB_SENG_0_SDMA_5_BASE,

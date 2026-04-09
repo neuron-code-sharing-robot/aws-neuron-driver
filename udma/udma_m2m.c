@@ -9,6 +9,7 @@
 
 #include "udma.h"
 #include "../neuron_arch.h"
+#include "../neuron_dhal.h"
 
 /* Note on terminology:
  * for historical reasons the code uses both m2s/s2m and Tx/Rx terminology
@@ -99,7 +100,7 @@ static void sdma_m2s_set_write_barrier(uint32_t *meta_ctrl)
 }
 
 /* set maximum number descriptors per one DMA packet */
-static int udma_set_max_descs_and_prefetch(struct udma *udma, u8 max_descs)
+int udma_set_max_descs_and_prefetch(struct udma *udma, u8 max_descs)
 {
 	// Due to DGE bug on V3 (https://tiny.amazon.com/tfw2hept)
 	// Min burst must equal Max burst, which is 8
@@ -467,7 +468,7 @@ void udma_m2m_set_axi_error_abort(struct udma *udma)
 
 	// step 2: program axi error control
 	for (i = 0; i < 6; i++) {
-		for (q = 0; q < DMA_MAX_Q_MAX; q++) {
+		for (q = 0; q < ndhal->ndhal_udma.num_queues; q++) {
 			reg_write32(&gen_regs->axi_error_control[i].table_addr, (q << 3) | 0x7);
 			reg_write32(&gen_regs->axi_error_control[i].table_data, 0x10);
 		}

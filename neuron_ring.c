@@ -31,7 +31,7 @@ module_param(dma_teardown_on_exit, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 MODULE_PARM_DESC(dma_teardown_on_exit, "Reset the DMA state on user process exit");
 
 // forward
-static void ndmar_h2t_ring_free(struct ndma_ring *ring);
+static void ndmar_h2t_ring_free(struct ndma_eng *eng, struct ndma_ring *ring);
 
 struct ndma_eng *ndmar_acquire_engine(struct neuron_device *nd, u32 eng_id)
 {
@@ -150,7 +150,7 @@ int ndmar_queue_init(struct neuron_device *nd, u32 eng_id, u32 qid, u32 tx_desc_
 	if (eng == NULL)
 		return -EINVAL;
 
-	if (qid >= DMA_MAX_Q_V4) {
+	if (qid >= ndhal->ndhal_udma.num_queues) {
 		ret = -EINVAL;
 		goto done;
 	}
@@ -220,7 +220,7 @@ void ndmar_handle_process_exit(struct neuron_device *nd, pid_t pid)
 	struct mem_chunk *mc = nd->ndma_q_dummy_mc;
 	const int desc_count = NDMA_QUEUE_DUMMY_RING_DESC_COUNT;
 	for (eng_id = 0; eng_id < ndhal->ndhal_address_map.seng_dma_eng_per_nd; eng_id++) {
-		for (qid = 0; qid < DMA_MAX_Q_MAX; qid++) {
+		for (qid = 0; qid < ndhal->ndhal_udma.num_queues; qid++) {
 			struct ndma_eng *eng = ndmar_acquire_engine_nl(nd, eng_id);
 			struct ndma_queue *queue;
 			struct ndma_ring *ring;
@@ -393,12 +393,26 @@ static int ndmar_h2t_ring_alloc(struct neuron_device *nd, int nc_id, int qid)
 	ring->h2t_completion.ptr = h2t_completion_mc->va;
 	ring->h2t_completion.addr = virt_to_phys(ring->h2t_completion.ptr) | ndhal->ndhal_address_map.pci_host_base;
 
+	ret = ndma_h2d_compl_queue_init(nd, &ring->dma_compl_queue);
+	if (ret) {
+		pr_err("can't initialize h2d dma completion queue\n");
+		goto error;
+	}
+
+	ret = ndma_ctx_queue_init(&ring->dma_ctx_queue);
+	if (ret) {
+		pr_err("can't initialize dma context queue\n");
+		goto error_ctx_queue;
+	}
+
 	mutex_init(&ring->h2t_ring_lock);
 
 	ndmar_release_engine(eng);
 
 	return 0;
 
+error_ctx_queue:
+	ndma_h2d_compl_queue_destroy(&ring->dma_compl_queue);
 error:
 	ring->h2t_nc_id = -1;
 	ring->tx_mc = NULL;
@@ -469,7 +483,7 @@ int ndmar_h2t_ring_request(struct neuron_device *nd, int nc_id, bool h2t, int *r
 	if (eng == NULL)
 		return -EINVAL;
 
-	for (qid = 0; qid < DMA_MAX_Q_MAX; qid++) {
+	for (qid = 0; qid < ndhal->ndhal_udma.num_queues; qid++) {
 		if (ndhal->ndhal_ndmar.ndmar_is_h2t_def_q(nd, eng_id, qid))
 			continue;
 		queue = ndmar_get_queue(eng, qid);
@@ -491,7 +505,7 @@ int ndmar_h2t_ring_request(struct neuron_device *nd, int nc_id, bool h2t, int *r
 				}
 				ret = ndmar_h2t_ring_init(eng, qid);
 				if (ret) {
-					ndmar_h2t_ring_free(ring);
+					ndmar_h2t_ring_free(eng, ring);
 					pr_err("nd%d:nc%d H2T ring init for qid:%d failed - %d\n", nd->device_index, nc_id, qid, ret);
 					ring->h2t_allocated = false;
 					goto done;
@@ -519,7 +533,7 @@ int ndmar_h2t_ring_release(struct neuron_device *nd, int nc_id, int qid)
 	struct ndma_queue *queue;
 	struct ndma_ring *ring;
 	
-	if (qid >= DMA_MAX_Q_MAX) {
+	if (qid >= ndhal->ndhal_udma.num_queues) {
 		return -EINVAL;
 	}
 
@@ -542,7 +556,7 @@ int ndmar_h2t_ring_release(struct neuron_device *nd, int nc_id, int qid)
 	}
 
 	if (ndmar_h2t_ring_is_h2t(ring)) {
-		ndmar_h2t_ring_free(ring);
+		ndmar_h2t_ring_free(eng, ring);
 	} else {
 		ndmar_h2t_ring_state_clr(ring);
 		queue->owner = 0;
@@ -768,7 +782,7 @@ int ndmar_init(struct neuron_device *nd)
 	return ndmar_init_ncs(nd, -1);
 }
 
-static void ndmar_h2t_ring_free(struct ndma_ring *ring)
+static void ndmar_h2t_ring_free(struct ndma_eng *eng, struct ndma_ring *ring)
 {
 	if (ring->tx_mc) {
 		mc_free(&ring->tx_mc);
@@ -790,6 +804,9 @@ static void ndmar_h2t_ring_free(struct ndma_ring *ring)
 		ring->h2t_completion_mc = NULL;
 	}
 
+	ndma_ctx_queue_free(eng, ring, &ring->dma_ctx_queue);
+	ndma_h2d_compl_queue_destroy(&ring->dma_compl_queue);
+
 	ndmar_h2t_ring_state_clr(ring);
 }
 
@@ -810,13 +827,13 @@ static void ndmar_h2t_ring_free_all(struct neuron_device *nd, int nc_idx)
 		return;
 	}
 
-	for (qid = 0; qid < DMA_MAX_Q_MAX; qid++) {
+	for (qid = 0; qid < ndhal->ndhal_udma.num_queues; qid++) {
 		queue = ndmar_get_queue(eng, qid);
 		ring = ndmar_get_ring(queue);
 		if (ndmar_h2t_ring_is_allocated(ring) && ring->h2t_nc_id == nc_idx) {
 			if (ndmar_h2t_ring_is_h2t(ring)) {
 				// h2t queue free all resources
-				ndmar_h2t_ring_free(ring);
+				ndmar_h2t_ring_free(eng, ring);
 			} else {
 				// service queue only clear state
 				ndmar_h2t_ring_state_clr(ring);

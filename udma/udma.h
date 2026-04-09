@@ -213,6 +213,28 @@ enum {
 int udma_init(struct udma *udma, struct udma_params *udma_params);
 
 /**
+ * udma_set_defaults() - set default configuration of one DMA engine
+ *
+ * @udma: udma structure needs to be initialized
+ *
+ * Return: 0 if UDMA is initialized successfully, a negative error code otherwise.
+ */
+int udma_set_defaults(struct udma *udma);
+
+/**
+ * udma_cache_defaults() - Cache frequently used CSR values.
+ *
+ * CSR reads are very slow and only one application(neuron) is using the DMA.
+ * So instead of reading CSR use hardware reset value(from datasheet) as
+ * default value.
+ *
+ * @udma: udma structure
+ *
+ * Return: 0 if UDMA is initialized successfully, a negative error code otherwise.
+ */
+int udma_cache_defaults(struct udma *udma);
+
+/**
  * udma_q_init() - Initialize the udma queue.
  *
  * Initializes DMA queue(hardware) and udma structure.
@@ -226,6 +248,15 @@ int udma_init(struct udma *udma, struct udma_params *udma_params);
  *	       -EIO if queue was already initialized.
  */
 int udma_q_init(struct udma *udma, u32 qid, struct udma_q_params *q_params);
+
+/**
+ * udma_q_enable() - Enables a udma queue
+ *
+ * @udma_q:	udma queue data structure
+ * @enable: flag to enable/disable
+ *
+ */
+void udma_q_enable(struct udma_q *udma_q, int enable);
 
 /**
  * udma_q_pause() - Pauses a udma queue
@@ -290,7 +321,7 @@ void udma_m2m_mask_ring_id_error(struct udma *udma, void __iomem *intc_base);
  * @udma: udma data structure
  * @state: new state to set
  *
-* Return: 0 on success, a negative error code otherwise.
+ * Return: 0 on success, a negative error code otherwise.
  */
 int udma_state_set(struct udma *udma, enum udma_state state);
 
@@ -302,6 +333,17 @@ int udma_state_set(struct udma *udma, enum udma_state state);
  * Return: the UDMA state as reported by the hardware.
  */
 enum udma_state udma_state_get(struct udma *udma, enum udma_type type);
+
+
+/**
+ * udma_set_max_descs_and_prefetch() - set maximum number descriptors per one DMA packet 
+ *
+ * @udma: udma handle
+ * @max_descs: max desc per packet
+ *
+ * Return: 0 on success, a negative error code otherwise.
+ */
+int udma_set_max_descs_and_prefetch(struct udma *udma, u8 max_descs);
 
 /**
  * udma_available_get() - Get number of descriptors that can be submitted to the udma.
