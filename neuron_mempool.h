@@ -9,7 +9,7 @@
  *  2. mempool/mp           - Is a pool of memory backed either device DRAM or host DRAM.
  *                            For device memory it uses gen_pool allocator to allocate memory.
  *                            For host memory it directly uses kmalloc().
- *  3. mempool_set/mpset    - Is collection for mp for given neuron device.
+ *  3. neuron_mempool_set/mpset    - Is collection for mp for given neuron device.
  */
 
 #ifndef NEURON_MEMPOOL_H
@@ -39,11 +39,11 @@ enum mem_location {
  * Device is memory is split in to chunks and allocated.
  * Uses genpool allocator in the backend.
  */
-struct mempool {
+struct neuron_mempool {
 	char name[32]; // friendly name
 	bool initialized; // True if initialized.
 
-	struct mempool_set *mpset; // parent mpset
+	struct neuron_mempool_set *mpset; // parent mpset
 
 	enum mem_location mem_location; // location of the memory
 	u32 dram_channel; // DRAM channel valid only if location is device
@@ -75,16 +75,16 @@ struct mempool {
 // Number for MPs for host allocation
 #define MP_HOST_RESERVE_MEMORY_POOL_COUNT 4
 
-struct mempool_set {
+struct neuron_mempool_set {
 	struct mutex lock;
 
 	struct neuron_device *nd; // backponter to neuron_device
 
 	u32 mp_device_num_regions; // number of regions in the device pool
 	u32 num_channels; // number of regions in the device pool
-	struct mempool mp_device[MAX_DRAM_CHANNELS][MAX_DDR_REGIONS]; // device memory pools
+	struct neuron_mempool mp_device[MAX_DRAM_CHANNELS][MAX_DDR_REGIONS]; // device memory pools
 
-	struct mempool mp_hrm[MP_HOST_RESERVE_MEMORY_POOL_COUNT]; // host reserve memory pools
+	struct neuron_mempool mp_hrm[MP_HOST_RESERVE_MEMORY_POOL_COUNT]; // host reserve memory pools
 
 	// linked list head to store mem_chunk of different lifespan
 	struct list_head mc_lifespan_local_head;
@@ -127,8 +127,8 @@ struct mem_chunk {
 
 	u64 size; // chunk size
 
-	struct mempool *mp; // backpointer to mp
-	struct mempool_set *mpset; // back pointer to mpset
+	struct neuron_mempool *mp; // backpointer to mp
+	struct neuron_mempool_set *mpset; // back pointer to mpset
 	struct gen_pool *gen_pool; // pointer to genpool
 
 	u32 dram_channel; // DRAM channel
@@ -160,14 +160,14 @@ struct mem_chunk {
  *
  * Return: 0 if initialization succeeds, a negative error code otherwise.
  */
-int mpset_constructor(struct mempool_set *mpset, void *pdev, struct neuron_device *nd);
+int mpset_constructor(struct neuron_mempool_set *mpset, void *pdev, struct neuron_device *nd);
 
 /**
  * mpset_destructor() - Free all mp in the set.
  *
  * @mpset: Pointer to mpset which need to be destroyed.
  */
-void mpset_destructor(struct mempool_set *mpset);
+void mpset_destructor(struct neuron_mempool_set *mpset);
 
 /** mpset_search_mc() - Find memory chunk which maps given physical address
  *
@@ -176,7 +176,7 @@ void mpset_destructor(struct mempool_set *mpset);
  *
  * Return: mem chunk that has pa on success, NULL on failure
  */
-struct mem_chunk *mpset_search_mc(struct mempool_set *mp, phys_addr_t pa);
+struct mem_chunk *mpset_search_mc(struct neuron_mempool_set *mp, phys_addr_t pa);
 
 /**
  * mc_alloc_align() - Allocate a memory chunk of size from given mpset, with alignment
@@ -210,7 +210,7 @@ void mc_free(struct mem_chunk **mcp);
  * @mpset: Pointer to mpset
  * @lifespan: Lifespan list to use
  */
-void mpset_free_expired_mc(struct mempool_set *mpset, enum mc_lifespan lifespan);
+void mpset_free_expired_mc(struct neuron_mempool_set *mpset, enum mc_lifespan lifespan);
 
 /**
  * mc_inc_refcount() - Increases reference count of the given mc.

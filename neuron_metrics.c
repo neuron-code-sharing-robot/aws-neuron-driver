@@ -33,6 +33,7 @@ MODULE_PARM_DESC(nmetric_log_posts, "1: send metrics to CW, 2: send metrics to t
 static int nmetric_counters_buf_size = sizeof(u64) * NMETRIC_COUNTER_COUNT;
 static int nmetric_versions_buf_size = sizeof(struct nmetric_versions) * NMETRIC_VERSION_COUNT;
 static int nmetric_constants_buf_size = sizeof(char) * NMETRIC_CONSTANTS_COUNT * (NEURON_METRICS_VERSION_STRING_MAX_LEN + 1);
+static int nmetric_ecc_err_buf_size = sizeof(u64) * NMETRIC_ECC_ERR_COUNT;
 
 static char nmetric_constant_metrics[NMETRIC_CONSTANTS_COUNT][NEURON_METRICS_VERSION_STRING_MAX_LEN + 1];
 static const char nmetric_instance_id_path[] = "/sys/devices/virtual/dmi/id/board_asset_tag";
@@ -66,6 +67,9 @@ enum nmetric_cw_id {
 	NMETRIC_CW_ID_ULTRASERVER_MODES_SUPPORTED = 57,
 	// Ultraserver mode configured on device (only for ULTRASERVER/PDS platforms), values defined in neuron_ultraserver_mode enum
 	NMETRIC_CW_ID_ULTRASERVER_MODE = 58,
+
+	// Workload ID based off hashed neff id
+	NMETRIC_CW_ID_AGG_NEFF_ID = 80,
 
 	// Platform Utilization Metrics
 	// Percentage of time that the neuron device was executing NEFFs in a given interval, aggregated across NCs
@@ -202,7 +206,6 @@ static const nmetric_def_t nmetric_defs[] = {
 	NMETRIC_COUNTER_DEF(18, POST_TIME_TICK_0, NMETRIC_CW_ID_NERR_OOB, NDS_NC_COUNTER_OOB),
 
 	NMETRIC_COUNTER_DEF(19, POST_TIME_TICK_1, NMETRIC_CW_ID_NERR_HW_ERR_COLLECTIVES, NDS_EXT_NC_COUNTER_HW_ERR_COLLECTIVES),
-	NMETRIC_COUNTER_DEF(20, POST_TIME_TICK_1, NMETRIC_CW_ID_NERR_HW_ERR_HBM_UE, NDS_EXT_NC_COUNTER_HW_ERR_HBM_UE),
 	NMETRIC_COUNTER_DEF(21, POST_TIME_TICK_1, NMETRIC_CW_ID_NERR_HW_ERR_NC_UE, NDS_EXT_NC_COUNTER_HW_ERR_NC_UE),
 	NMETRIC_COUNTER_DEF(22, POST_TIME_TICK_1, NMETRIC_CW_ID_NERR_HW_ERR_DMA_ABORT, NDS_EXT_NC_COUNTER_HW_ERR_DMA_ABORT),
 
@@ -212,8 +215,11 @@ static const nmetric_def_t nmetric_defs[] = {
 	NMETRIC_COUNTER_DEF(25, POST_TIME_TICK_1, NMETRIC_CW_ID_NERR_SW_EVENT_ERROR, NDS_EXT_NC_COUNTER_ERR_SW_EVENT_ERROR),
 	NMETRIC_COUNTER_DEF(26, POST_TIME_TICK_1, NMETRIC_CW_ID_NERR_SW_PSUM_COLLISION, NDS_EXT_NC_COUNTER_ERR_SW_PSUM_COLLISION),
 	NMETRIC_COUNTER_DEF(27, POST_TIME_TICK_1, NMETRIC_CW_ID_NERR_SW_SEQUENCER_FATAL, NDS_EXT_NC_COUNTER_ERR_SW_SEQUENCER_FATAL),
-	NMETRIC_COUNTER_DEF(28, POST_TIME_TICK_1, NMETRIC_CW_ID_NERR_HW_ERR_REPAIRABLE_HBM_UE, NDS_EXT_NC_COUNTER_HW_ERR_REPAIRABLE_HBM_UE),
 	NMETRIC_UTILIZATION_DEF(29, POST_TIME_ALWAYS, NMETRIC_CW_ID_NC_UTILIZATION, NDS_NC_COUNTER_TIME_IN_USE),
+
+	// ECC Error Count Metrics
+	NMETRIC_DRIVER_ECC_ERR_DEF(0, POST_TIME_TICK_1, NMETRIC_CW_ID_NERR_HW_ERR_HBM_UE),
+	NMETRIC_DRIVER_ECC_ERR_DEF(1, POST_TIME_TICK_1, NMETRIC_CW_ID_NERR_HW_ERR_REPAIRABLE_HBM_UE),
 
 	// bitmap metrics
 	NMETRIC_BITMAP_DEF(0, POST_TIME_TICK_1, NMETRIC_CW_ID_FEATURE_BITMAP, NDS_ND_COUNTER_FEATURE_BITMAP),
@@ -221,6 +227,7 @@ static const nmetric_def_t nmetric_defs[] = {
 
 	// const uint64 metrics
 	NMETRIC_CONSTANT_U64(0, POST_TIME_TICK_1, NMETRIC_CW_ID_DEVICE_CLUSTER_ID, NDS_ND_COUNTER_DEVICE_CLUSTER_ID, NMETRIC_CONST_U64_FLAG_SKIP_ZERO),
+	NMETRIC_CONSTANT_U64(1, POST_TIME_TICK_1, NMETRIC_CW_ID_AGG_NEFF_ID, NDS_ND_COUNTER_AGG_NEFF_ID, NMETRIC_CONST_U64_FLAG_SKIP_ZERO),
 
 	// driver metrics. not in datastore
 	NMETRIC_DRIVER_DEF(NMETRIC_DRIVER_METRICS_IDX_MAX_DEVICE_RESET_TIME_MS, POST_TIME_TICK_1, NMETRIC_CW_ID_MAX_DEVICE_RESET_TIME_MS),
@@ -649,10 +656,10 @@ static inline int nmetric_post_feature_bitmap(const nmetric_def_t *metric, struc
 	return metric_size;
 }
 
-static int nmetric_post_u64(const nmetric_def_t *metric, u64 metric_value, struct nmetric_cw_metric *dest, int available_size)
+static int nmetric_post_u64_fmt(const nmetric_def_t *metric, const char *format, u64 metric_value, struct nmetric_cw_metric *dest, int available_size)
 {
 	// check if there is enough space in buffer
-	int expected_len = snprintf(NULL, 0, "%llu", metric_value);
+	int expected_len = snprintf(NULL, 0, format, metric_value);
 	int metric_size = sizeof(struct nmetric_cw_metric) + expected_len;
 	if (available_size < metric_size) {
 		return 0;
@@ -661,12 +668,12 @@ static int nmetric_post_u64(const nmetric_def_t *metric, u64 metric_value, struc
 	// save metrics to buffer
 	dest->id = metric->cw_id;
 	dest->len = expected_len;
-	snprintf(dest->data, expected_len + 1, "%llu", metric_value); // post the as decimal not hex, as cw reads it in decimal format
+	snprintf(dest->data, expected_len + 1, format, metric_value);
 
 	return metric_size;
 }
 
-static inline int nmetric_post_constant_u64(const nmetric_def_t *metric, struct nmetric_cw_metric *dest, u64 *const_u64_metrics, u64 *freed_const_u64_metrics, int available_size)
+static inline int nmetric_post_constant_u64_fmt(const nmetric_def_t *metric, const char *format, u64 *const_u64_metrics, u64 *freed_const_u64_metrics, struct nmetric_cw_metric *dest, int available_size)
 {
 	// we have a choice of taking the metric value from previous
 	// NDS or current NDS.
@@ -687,7 +694,17 @@ static inline int nmetric_post_constant_u64(const nmetric_def_t *metric, struct 
 			return 0;
 	}
 
-	return nmetric_post_u64(metric, metric_value, dest, available_size);
+	return nmetric_post_u64_fmt(metric, format, metric_value, dest, available_size);
+}
+
+static inline int nmetric_post_decimal_constant_u64(const nmetric_def_t *metric, struct nmetric_cw_metric *dest, u64 *const_u64_metrics, u64 *freed_const_u64_metrics, int available_size)
+{
+	return nmetric_post_constant_u64_fmt(metric, "%llu", const_u64_metrics, freed_const_u64_metrics, dest, available_size);
+}
+
+static inline int nmetric_post_hex_constant_u64(const nmetric_def_t *metric, struct nmetric_cw_metric *dest, u64 *const_u64_metrics, u64 *freed_const_u64_metrics, int available_size)
+{
+	return nmetric_post_constant_u64_fmt(metric, "%llx", const_u64_metrics, freed_const_u64_metrics, dest, available_size);
 }
 
 // TODO: This function is a quick workaround to post and reset the driver metrics:
@@ -721,7 +738,7 @@ static inline int nmetric_post_and_reset_driver_metrics(const nmetric_def_t *dri
 			metric_value = total_time / total_count;
 	}
 
-	return nmetric_post_u64(driver_final_metric, metric_value, dest, available_size);
+	return nmetric_post_u64_fmt(driver_final_metric, "%llu", metric_value, dest, available_size);
 }
 
 static inline int nmetric_post_driver_userver_metrics(const nmetric_def_t *metric, struct nmetric_cw_metric *dest, int available_size)
@@ -754,7 +771,51 @@ static inline int nmetric_post_driver_userver_metrics(const nmetric_def_t *metri
 		metric_value = mode;
 	}
 
-	return nmetric_post_u64(metric, metric_value, dest, available_size);
+	return nmetric_post_u64_fmt(metric, "%llu", metric_value, dest, available_size);
+}
+
+/**
+ * Function for updating the ECC memory error counts in the driver. Uses the same parsing logic for the ECC miscram registers as the sysfs
+ * module to ensure data consistency.
+ *
+ * @param metric Current metric to be posted
+ * @param dest The destination buffer to write the TVL metric data into
+ * @param available_size The remaining size in the dest buffer
+ *
+ * @return Size of the metric posting when appended to the buffer
+ */
+static inline int nmetric_post_driver_ecc_metrics(struct neuron_device *nd, const nmetric_def_t *metric, 
+						  struct nmetric_cw_metric *dest, int available_size)
+{
+	uint32_t metric_value = 0;
+	
+	// Read the current value of the hbm_err_count registers in miscram using the same function as sysfs for consistency
+	switch (metric->cw_id) {
+		case NMETRIC_CW_ID_NERR_HW_ERR_HBM_UE:
+			ndhal->ndhal_sysfs_metrics.nsysfsmetric_get_hbm_error_count(nd, false, &metric_value);
+		break;
+		case NMETRIC_CW_ID_NERR_HW_ERR_REPAIRABLE_HBM_UE:
+			ndhal->ndhal_sysfs_metrics.nsysfsmetric_get_hbm_error_count(nd, true, &metric_value);
+		break;
+		default:
+			pr_err_once("Unrecognized ECC Metric ID %d. Skipping parsing metric", metric->cw_id);
+			return 0;
+		break;
+	}
+
+	// Subtract out previous errors during this session e.g. we get HBM UEs but do not degrade the node. Prevents double counting errors.
+	// In the case we detect an underflow, record the metric as 0 and set ecc_prev to the current register value. This is mostly to combat
+	// the case where Pacific has a bug in register writing, or resets the chip underneath us.
+	if (nd->metrics.neuron_aggregation.ecc_prev[metric->index] <= metric_value) {
+		metric_value -= nd->metrics.neuron_aggregation.ecc_prev[metric->index];
+		nd->metrics.neuron_aggregation.ecc_prev[metric->index] += metric_value;
+	} else {
+		pr_warn_once("Integer underflow detected when parsing HBM UE metrics. Adjusting stats to avoid an overcount.");
+		nd->metrics.neuron_aggregation.ecc_prev[metric->index] = metric_value;
+		metric_value = 0;
+	}
+
+	return nmetric_post_u64_fmt(metric, "%llu", metric_value, dest, available_size);
 }
 
 /**
@@ -793,33 +854,40 @@ static void nmetric_post_metrics(struct neuron_device *nd, u64 *curr_metrics, u6
 		}
 		dest = (struct nmetric_cw_metric *)&nd->metrics.posting_buffer[data_size];
 		switch(curr_metric->type) {
-		case NMETRIC_TYPE_CONSTANT:
-			data_size += nmetric_post_constant(curr_metric, dest, available_size);
-		break;
-		case NMETRIC_TYPE_VERSION:
-			data_size += nmetric_post_version(versions, curr_metric, dest, available_size);
-		break;
-		case NMETRIC_TYPE_UTILIZATION:
-			data_size += nmetric_post_utilization(nd, curr_metrics, prev_metrics, freed_metrics,
-							      curr_metric, dest, available_size);
-		break;
-		case NMETRIC_TYPE_COUNTER:
-		case NMETRIC_TYPE_FW_IO_ERR:
-			data_size += nmetric_post_counter(curr_metrics, prev_metrics, freed_metrics,
-							  curr_metric, dest, available_size);
-		break;
-		case NMETRIC_TYPE_BITMAP:
-			data_size += nmetric_post_feature_bitmap(curr_metric, dest, curr_feature_bitmap, freed_feature_bitmap, available_size);
-		break;
-		case NMETRIC_TYPE_CONSTANT_U64:
-			data_size += nmetric_post_constant_u64(curr_metric, dest, const_u64_metrics, freed_const_u64_metrics, available_size);
-		break;
-		case NMETRIC_TYPE_DRIVER_RESET:
-			data_size += nmetric_post_and_reset_driver_metrics(curr_metric, dest, &nd->metrics.driver_metrics, available_size);
-		break;
-		case NMETRIC_TYPE_DRIVER_USERVER:
-			data_size += nmetric_post_driver_userver_metrics(curr_metric, dest, available_size);
-		break;
+			case NMETRIC_TYPE_CONSTANT:
+				data_size += nmetric_post_constant(curr_metric, dest, available_size);
+			break;
+			case NMETRIC_TYPE_VERSION:
+				data_size += nmetric_post_version(versions, curr_metric, dest, available_size);
+			break;
+			case NMETRIC_TYPE_UTILIZATION:
+				data_size += nmetric_post_utilization(nd, curr_metrics, prev_metrics, freed_metrics,
+								      curr_metric, dest, available_size);
+			break;
+			case NMETRIC_TYPE_COUNTER:
+			case NMETRIC_TYPE_FW_IO_ERR:
+				data_size += nmetric_post_counter(curr_metrics, prev_metrics, freed_metrics,
+								  curr_metric, dest, available_size);
+			break;
+			case NMETRIC_TYPE_BITMAP:
+				data_size += nmetric_post_feature_bitmap(curr_metric, dest, curr_feature_bitmap, freed_feature_bitmap, available_size);
+			break;
+			case NMETRIC_TYPE_CONSTANT_U64:
+				if (curr_metric->cw_id == NMETRIC_CW_ID_AGG_NEFF_ID) {
+					data_size += nmetric_post_hex_constant_u64(curr_metric, dest, const_u64_metrics, freed_const_u64_metrics, available_size);
+	 			} else {
+	 				data_size += nmetric_post_decimal_constant_u64(curr_metric, dest, const_u64_metrics, freed_const_u64_metrics, available_size);
+	 			}
+			break;
+			case NMETRIC_TYPE_DRIVER_RESET:
+				data_size += nmetric_post_and_reset_driver_metrics(curr_metric, dest, &nd->metrics.driver_metrics, available_size);
+			break;
+			case NMETRIC_TYPE_DRIVER_USERVER:
+				data_size += nmetric_post_driver_userver_metrics(curr_metric, dest, available_size);
+			break;
+			case NMETRIC_TYPE_ECC_ERR_COUNTER:
+				data_size += nmetric_post_driver_ecc_metrics(nd, curr_metric, dest, available_size);
+			break;
 		}
 	}
 
@@ -996,6 +1064,7 @@ static int nmetric_thread_fn(void *arg)
 	memset(nd->metrics.neuron_aggregation.prev, 0, nmetric_counters_buf_size);
 	memset(nd->metrics.neuron_aggregation.curr, 0, nmetric_counters_buf_size);
 	memset(nd->metrics.neuron_aggregation.freed, 0, nmetric_counters_buf_size);
+	memset(nd->metrics.neuron_aggregation.ecc_prev, 0, nmetric_ecc_err_buf_size);
 	memset(component_versions, 0, nmetric_versions_buf_size);
 	curr_feature_bitmap = 0;
 	freed_feature_bitmap = 0;

@@ -9,12 +9,15 @@
 #include <linux/delay.h>
 #include <linux/fault-inject.h>
 #include <linux/mm.h>
+#include <linux/sched/mm.h>
+#include <linux/bitops.h>
 
 #include "udma/udma.h"
 #include "neuron_trace.h"
 #include "neuron_device.h"
 #include "neuron_dma.h"
 #include "neuron_mempool.h"
+#include "neuron_mmap.h"
 #include "neuron_dhal.h"
 #include "neuron_pci.h"
 
@@ -233,6 +236,10 @@ int ndma_memcpy_wait_for_completion(struct ndma_eng *eng, struct ndma_ring *ring
 	u64 first_wait_time, wait;
 
 	ndhal->ndhal_ndma.ndma_get_wait_for_completion_time(count, async, &first_wait_time, &wait);
+	// Increase the wait time on virtual platforms
+	if (narch_is_qemu() || narch_is_emu()) {
+		wait = wait * 100 * 1000;
+	}
 	if (is_intra_device_dma && !async) {
 		first_wait_time = 10; // device-to-device DMA is much faster, just choose a small value independent of number of descriptors
 		wait = wait/200; // can probably be set even lower if required
@@ -271,7 +278,7 @@ int ndma_memcpy_wait_for_completion(struct ndma_eng *eng, struct ndma_ring *ring
 	}
 	if (i > loop) {
 		pr_err("DMA completion timeout on nd%02d for %s q%d desc count %u\n", eng->nd->device_index, eng->udma.name, ring->qid, count);
-		ret = -1;
+		ret = -ETIMEDOUT;
 		goto error;
 	}
 
@@ -876,7 +883,7 @@ int ndma_bar0_blocked_one_engine(u64 base, u64 off)
 			q_start = base + offsetof(struct unit_regs_v4, s2m); // start of s2m block
 			q_start += offsetof(struct udma_s2m_regs_v4, s2m_q); // start of q registers
 		}
-		for (qid = 0; qid < DMA_MAX_Q_V4; qid++) {
+		for (qid = 0; qid < ndhal->ndhal_udma.num_queues; qid++) {
 			u64 q_off = q_start + q_size * qid;
 			int i;
 			for (i = 0; i < sizeof(udma_blocked) / sizeof(udma_blocked[0]); i++) {
@@ -891,36 +898,459 @@ int ndma_bar0_blocked_one_engine(u64 base, u64 off)
 
 /*
  * Zero copy impementation.
- *
- *
- *
  */
 
-struct ndma_h2t_zcdma_context {
-	struct ndma_eng  *eng;                // engine 
-	struct ndma_ring *ring;               //
-	void             *host_addr;          // host address
-	dma_addr_t        dev_addr;           // device address
-	u64               size;               // size for this transfer
-	bool              direction;          // direction. true = to device
-	bool              last;               // last transfer for the entire request.
-	u64               start_time;         // start time for this transfer
-	int               nr_pages;           // number of pages for this transfer
-	int               nr_desc;            // number of descriptors which is equal to pending transfers -1
-	void             *completion_ptr;     // completion buffer pointer (host memory buffer we poll on for completions)
-	struct page     **page_list;          // page structures tracking our pinned pages
+/* Context for tracking a single tensor batch operation on submit flow */
+struct ndma_h2t_zcdma_op_context {
+	void       *host_addr;
+	dma_addr_t  dev_addr;
+	u64         offset;
+	u64         pin_size;
+	u64         remaining;
 };
 
+/* DMA context state */
+enum ndma_zcdma_state {
+	NDMA_INVALID = 0,
+	NDMA_UNPINNED,
+	NDMA_PINNED_UNSUBMITTED,
+	NDMA_SUBMITTED,
+	NDMA_COMPLETED, // not in dma context queue anymore
+};
 
-#define NDMA_ZC_PAGES_PER_XFER  64        // number of pages in each zero copy dma transfer.  This is somewhat, but not 
+/* DMA context */
+struct ndma_h2t_zcdma_context {
+	struct ndma_eng  *eng;                // engine
+	struct ndma_ring *ring;               // ring
+
+	// Submission-related
+	void                 *host_addr;          // host address
+	dma_addr_t            dev_addr;           // device address
+	u64                   size;               // size for this transfer
+	bool                  direction;          // direction. true = to-device/write/copy-in
+	bool                  last;               // last transfer for the entire request.
+	u64                   start_time;         // start time for this transfer
+	int                   nr_pages;           // number of pages for this transfer
+	int                   nr_desc;            // number of descriptors which is equal to pending transfers -1
+	struct page         **page_list;          // page structures tracking our pinned pages;
+											  // managed by page_list_pool in ctx queue
+	enum ndma_zcdma_state state;              // state of this transfer
+
+	// Completion-related
+	void                 *completion_ptr;     // completion buffer pointer;
+											  // host memory buffer which driver polls on for completions;
+											  // managed by completion_pool in ctx queue
+	u64                   sequence_num;       // async sequence number; 0 for sync transfers
+
+	// Async-only
+	struct mm_struct     *mm;                 // mm that owns the user buffers
+};
+
+static void ndma_zc_release_ctx(struct ndma_h2t_zcdma_context *ctx, u64 *nr_pinned_pages)
+{
+	// do not free or set completion_ptr null. it is managed by completion_pool in ctx queue
+	// do not free or set page_list null. it is managed by page_list_pool in ctx queue
+
+	if (ctx->state >= NDMA_PINNED_UNSUBMITTED) {
+		if (ctx->direction) {
+			unpin_user_pages(ctx->page_list, ctx->nr_pages);
+		} else {
+			unpin_user_pages_dirty_lock(ctx->page_list, ctx->nr_pages, true);
+		}
+		*nr_pinned_pages -= ctx->nr_pages;
+	}
+	ctx->nr_pages = 0;
+
+	if (ctx->mm) {
+		mmput(ctx->mm);
+		ctx->mm = NULL;
+	}
+
+	ctx->state = NDMA_INVALID;
+	ctx->sequence_num = 0;
+}
+
+/* H2D DMA Completion Queue (CQ) */
+#define NDMA_H2D_COMPL_QUEUE_CAPACITY 1024
+int ndma_h2d_compl_queue_init(struct neuron_device *nd, struct ndma_h2d_compl_queue *compl_queue)
+{
+	int ret = 0;
+	size_t queue_size = 0;
+	struct mem_chunk *mc = NULL;
+	neuron_h2d_dma_compl_queue_t *compl_queue_shared = NULL;
+
+	queue_size = sizeof(neuron_h2d_dma_compl_queue_t) + (NDMA_H2D_COMPL_QUEUE_CAPACITY * sizeof(neuron_h2d_dma_compl_queue_entry_t));
+	ret = mc_alloc_align(nd, MC_LIFESPAN_DEVICE, queue_size, 0,
+						 MEM_LOC_HOST, 0, 0, 0,
+						 NEURON_MEMALLOC_TYPE_NCDEV_HOST, &mc);
+	if (ret) {
+		pr_err("failed to allocate h2d dma completion queue mc: %d\n", ret);
+		return ret;
+	}
+	ret = nmch_handle_alloc(nd, mc, &mc->mc_handle);
+	if (ret) {
+		pr_err("failed to allocate mc handle for h2d dma completion queue: %d\n", ret);
+		mc_free(&mc);
+		return ret;
+	}
+	memset(mc->va, 0, queue_size);
+
+	compl_queue_shared = (neuron_h2d_dma_compl_queue_t *)mc->va;
+	compl_queue_shared->capacity = NDMA_H2D_COMPL_QUEUE_CAPACITY;
+	compl_queue_shared->head = 0;
+	compl_queue_shared->tail = 0;
+
+	compl_queue->mc = mc;
+	compl_queue->compl_queue_shared = compl_queue_shared;
+	compl_queue->capacity_mask = NDMA_H2D_COMPL_QUEUE_CAPACITY - 1;
+	compl_queue->tail = 0;
+
+	return 0;
+}
+
+void ndma_h2d_compl_queue_destroy(struct ndma_h2d_compl_queue *compl_queue)
+{
+	if (compl_queue->mc) {
+		mc_free(&compl_queue->mc);
+	}
+	compl_queue->mc = NULL;
+	compl_queue->compl_queue_shared = NULL;
+	compl_queue->capacity_mask = 0;
+	compl_queue->tail = 0;
+}
+
+static void ndma_h2d_compl_queue_put(struct ndma_h2d_compl_queue *compl_queue,
+									 u64 sequence_num,
+									 s64 compl_ret,
+									 void *context)
+{
+	u32 head = 0;
+	u32 tail = 0;
+	neuron_h2d_dma_compl_queue_t *compl_queue_shared = compl_queue->compl_queue_shared;
+	neuron_h2d_dma_compl_queue_entry_t *entry = NULL;
+
+	head = smp_load_acquire(&compl_queue_shared->head);
+	tail = compl_queue->tail;
+
+	while ((tail - head) >= (compl_queue->capacity_mask + 1)) {
+		pr_warn_once("h2d dma completion queue full; blocking until space is available\n");
+		msleep(1);
+		head = smp_load_acquire(&compl_queue_shared->head);
+		tail = compl_queue->tail;
+	}
+
+	entry = &compl_queue_shared->entries[tail & compl_queue->capacity_mask];
+
+	/* Write completion result to tail */
+	entry->compl_ret = compl_ret;
+	entry->context = context;
+	entry->sequence_num = sequence_num;
+
+	/* Move tail */
+	compl_queue->tail = tail + 1;
+	smp_store_release(&compl_queue_shared->tail, compl_queue->tail);
+}
+
+#define NDMA_ZC_PAGES_PER_XFER  64        // number of pages in each zero copy dma transfer.  This is somewhat, but not
 										  // totally arbitrary.  We don't want to pin a lot of pages. We just want to
 										  // pin enough where (approximately):  
 										  //       dma time > (pin time + setup time + completion update + initial poll wait)
 										  // That's the simple explanation. It's a tad more complicated in trading off smaller
 										  // transfers where even if that equation doesn't hold, the overlap can be beneficial.
 										  // Right now the sweet spot looks to be ~ 64 pages.  More tuning is required.
-										  // 
 #define NDMA_ZC_MIN_PAGES_PER_XFER 64
+
+/* Hysteresis thresholds for descriptor wait checks in submission flow. */
+#define NDMA_ZC_DESC_WAIT_THRESHOLD_LO (NDMA_ZC_PAGES_PER_XFER    + 1)
+#define NDMA_ZC_DESC_WAIT_THRESHOLD_HI (NDMA_ZC_DESC_WAIT_THRESHOLD_LO * 8)
+
+/* DMA ctx queue constants */
+#define NDMA_CTX_QUEUE_DEFAULT_CAPACITY   1024
+#define NDMA_CTX_QUEUE_MAX_PINNED_PAGES   524288
+
+/* Skip tombstone ctxs */
+static void ndma_ctx_queue_advance_to_valid(struct ndma_ctx_queue *queue, u32 *idx, u32 stop)
+{
+	while (*idx != stop && queue->entries[*idx].state == NDMA_INVALID) {
+		*idx = (*idx + 1) & queue->capacity_mask;
+	}
+}
+
+/* Check empty or full */
+static bool ndma_ctx_queue_is_empty(const struct ndma_ctx_queue *queue)
+{
+	return queue->head == queue->tail;
+}
+
+static bool ndma_ctx_queue_is_full(const struct ndma_ctx_queue *queue)
+{
+	return queue->head == ((queue->tail + 1) & queue->capacity_mask);
+}
+
+static bool ndma_ctx_queue_submitted_empty(const struct ndma_ctx_queue *queue)
+{
+	return queue->head == queue->first_pinned_unsubmitted;
+}
+
+static bool ndma_ctx_queue_pinned_unsubmitted_empty(const struct ndma_ctx_queue *queue)
+{
+	return queue->first_pinned_unsubmitted == queue->first_unpinned;
+}
+
+static bool ndma_ctx_queue_unpinned_empty(const struct ndma_ctx_queue *queue)
+{
+	return queue->first_unpinned == queue->tail;
+}
+
+/* Increment to next index */
+static void ndma_ctx_queue_inc_first_pinned_unsubmitted(struct ndma_ctx_queue *queue)
+{
+	if (ndma_ctx_queue_pinned_unsubmitted_empty(queue)) {
+		return;
+	}
+	queue->first_pinned_unsubmitted = (queue->first_pinned_unsubmitted + 1) & queue->capacity_mask;
+	ndma_ctx_queue_advance_to_valid(queue, &queue->first_pinned_unsubmitted, queue->first_unpinned);
+}
+
+static void ndma_ctx_queue_inc_first_unpinned(struct ndma_ctx_queue *queue)
+{
+	if (ndma_ctx_queue_unpinned_empty(queue)) {
+		return;
+	}
+	queue->first_unpinned = (queue->first_unpinned + 1) & queue->capacity_mask;
+	ndma_ctx_queue_advance_to_valid(queue, &queue->first_unpinned, queue->tail);
+}
+
+static void ndma_ctx_queue_inc_tail(struct ndma_ctx_queue *queue)
+{
+	u32 old_tail = queue->tail;
+	u32 new_tail = (old_tail + 1) & queue->capacity_mask;
+
+	// Assume the ctx at old tail is already filled by caller
+	// Tail advance may also initialize/advance the pinned+unsubmitted and unpinned pointers
+	struct ndma_h2t_zcdma_context *ctx = &queue->entries[old_tail];
+	if (ctx->state == NDMA_PINNED_UNSUBMITTED) {
+		if (ndma_ctx_queue_pinned_unsubmitted_empty(queue)) {
+			// The first pinned+unsubmitted pointer appears at old_tail
+			queue->first_pinned_unsubmitted = old_tail;
+		}
+		if (ndma_ctx_queue_unpinned_empty(queue)) {
+			// No unpinned elements yet; start after the new tail
+			queue->first_unpinned = new_tail;
+		}
+	} else if (ctx->state == NDMA_UNPINNED) {
+		if (ndma_ctx_queue_unpinned_empty(queue)) {
+			// The first unpinned pointer appears at old_tail
+			queue->first_unpinned = old_tail;
+		}
+	}
+
+	// Move tail forward after updating the two pointers
+	queue->tail = new_tail;
+}
+
+/* Peek */
+static struct ndma_h2t_zcdma_context *ndma_ctx_queue_peek_tail(struct ndma_ctx_queue *queue)
+{
+	if (ndma_ctx_queue_is_full(queue)) {
+		return NULL;
+	}
+	return &queue->entries[queue->tail];
+}
+
+static struct ndma_h2t_zcdma_context *ndma_ctx_queue_peek_pinned_unsubmitted(struct ndma_ctx_queue *queue)
+{
+	if (ndma_ctx_queue_pinned_unsubmitted_empty(queue)) {
+		return NULL;
+	}
+	return &queue->entries[queue->first_pinned_unsubmitted];
+}
+
+static struct ndma_h2t_zcdma_context *ndma_ctx_queue_peek_first_unpinned(struct ndma_ctx_queue *queue)
+{
+	if (ndma_ctx_queue_unpinned_empty(queue)) {
+		return NULL;
+	}
+	return &queue->entries[queue->first_unpinned];
+}
+
+/* Pop */
+static struct ndma_h2t_zcdma_context *ndma_ctx_queue_pop_head(struct ndma_ctx_queue *queue)
+{
+	u32 old_head;
+	struct ndma_h2t_zcdma_context *ctx = NULL;
+
+	if (ndma_ctx_queue_is_empty(queue)) {
+		return NULL;
+	}
+
+	old_head = queue->head;
+	ctx = &queue->entries[old_head];
+	queue->head = (queue->head + 1) & queue->capacity_mask;
+	ndma_ctx_queue_advance_to_valid(queue, &queue->head, queue->tail);
+
+	if (ndma_ctx_queue_is_empty(queue)) {
+		queue->first_pinned_unsubmitted = queue->tail;
+		queue->first_unpinned = queue->tail;
+	} else {
+		if (old_head == queue->first_pinned_unsubmitted) {
+			ndma_ctx_queue_inc_first_pinned_unsubmitted(queue);
+		}
+		if (old_head == queue->first_unpinned) {
+			ndma_ctx_queue_inc_first_unpinned(queue);
+		}
+	}
+
+	return ctx;
+}
+
+static struct ndma_h2t_zcdma_context *ndma_ctx_queue_pop_submitted(struct ndma_ctx_queue *queue)
+{
+	if (ndma_ctx_queue_submitted_empty(queue)) {
+		return NULL;
+	}
+
+	return ndma_ctx_queue_pop_head(queue);
+}
+
+/* Failure-path helper.
+ * Given a sequence number of a async request, wait for any matching submitted ctxs, then reset all matching ctxs.
+ * This prevents further remote pinning and submitting on a failed async request.
+ * Mostly used in failure and cleanup paths, so don't stop on failed DMAs.
+ */
+static void ndma_ctx_queue_drain_sequence(struct ndma_ctx_queue *queue, u64 sequence_num)
+{
+	u32 idx;
+
+	for (idx = queue->head; idx != queue->tail; idx = (idx + 1) & queue->capacity_mask) {
+		struct ndma_h2t_zcdma_context *ctx = &queue->entries[idx];
+
+		if (ctx->sequence_num == sequence_num) {
+			// wait for already submitted DMAs to complete.
+			if (ctx->state == NDMA_SUBMITTED) {
+				ndma_memcpy_wait_for_completion(ctx->eng, ctx->ring, ctx->nr_desc + 1, ctx->completion_ptr, false, false);
+			}
+
+			// release pinned pages and mm, and set state to invalid (tombstone).
+			ndma_zc_release_ctx(ctx, &queue->nr_pinned_pages);
+		}
+	}
+
+	// After draining, advance the pointers to skip the invalidated ctxs.
+	ndma_ctx_queue_advance_to_valid(queue, &queue->first_unpinned, queue->tail);
+	ndma_ctx_queue_advance_to_valid(queue, &queue->first_pinned_unsubmitted, queue->first_unpinned);
+	ndma_ctx_queue_advance_to_valid(queue, &queue->head, queue->tail);
+}
+
+/* Failure-path helper.
+ * Wait for submitted contexts from head up to (but not including) first_pinned_unsubmitted.
+ * Unpin from head up to (but not including) first_unpinned.
+ * Mostly used in failure and cleanup paths, so don't stop on failed DMAs.
+ */
+static void ndma_ctx_queue_drain(struct ndma_eng *eng,
+								 struct ndma_ring *ring,
+								 struct ndma_ctx_queue *queue)
+{
+	while (!ndma_ctx_queue_is_empty(queue)) {
+		struct ndma_h2t_zcdma_context *ctx = ndma_ctx_queue_pop_head(queue);
+
+		if (ctx->state == NDMA_SUBMITTED) {
+			ndma_memcpy_wait_for_completion(eng, ring, ctx->nr_desc + 1, ctx->completion_ptr, false, false);
+		}
+
+		ndma_zc_release_ctx(ctx, &queue->nr_pinned_pages);
+	}
+}
+
+/* Init and destroy queue */
+int ndma_ctx_queue_init(struct ndma_ctx_queue *queue)
+{
+	int i;
+
+	if (!queue) {
+		pr_err("ctx queue pointer cannot be NULL\n");
+		return -EINVAL;
+	}
+
+	memset(queue, 0, sizeof(*queue));
+
+	u32 capacity = NDMA_CTX_QUEUE_DEFAULT_CAPACITY;
+	if (!is_power_of_2(capacity)) {
+		pr_err("ctx queue capacity must be power of two\n");
+		return -EINVAL;
+	}
+	queue->capacity_mask = capacity - 1;
+	queue->head = 0;
+	queue->tail = 0;
+	queue->first_pinned_unsubmitted = 0;
+	queue->first_unpinned = 0;
+
+	queue->entries = kvcalloc(capacity, sizeof(*queue->entries), GFP_KERNEL);
+	if (!queue->entries) {
+		pr_err("failed to allocate ctx queue entries\n");
+		return -ENOMEM;
+	}
+
+	// allocate completion ptrs in one contiguous array at once,
+	// and let queue->entries[i].completion_ptr point to each completion buffer
+	queue->completion_pool = kcalloc(capacity, DMA_COMPLETION_MARKER_SIZE * 2, GFP_KERNEL);
+	if (!queue->completion_pool) {
+		pr_err("failed to allocate ctx queue completion pool\n");
+		goto err;
+	}
+
+	// allocate page_list arrays in one contiguous pool, and let each entry point to its slice
+	queue->page_list_pool = kcalloc(capacity * NDMA_ZC_PAGES_PER_XFER, sizeof(struct page *), GFP_KERNEL);
+	if (!queue->page_list_pool) {
+		pr_err("failed to allocate ctx queue page_list pool\n");
+		goto err;
+	}
+
+	for (i = 0; i < capacity; i++) {
+		queue->entries[i].completion_ptr =
+			(u8 *)queue->completion_pool + i * DMA_COMPLETION_MARKER_SIZE * 2;
+		queue->entries[i].page_list =
+			(struct page **)queue->page_list_pool + i * NDMA_ZC_PAGES_PER_XFER;
+	}
+
+	return 0;
+
+err:
+	if (queue->completion_pool) {
+		kfree(queue->completion_pool);
+		queue->completion_pool = NULL;
+	}
+	if (queue->page_list_pool) {
+		kfree(queue->page_list_pool);
+		queue->page_list_pool = NULL;
+	}
+	if (queue->entries) {
+		kvfree(queue->entries);
+		queue->entries = NULL;
+	}
+	return -ENOMEM;
+}
+
+void ndma_ctx_queue_free(struct ndma_eng *eng, struct ndma_ring *ring, struct ndma_ctx_queue *queue)
+{
+	if (!queue) {
+		return;
+	}
+	if (queue->entries) {
+		ndma_ctx_queue_drain(eng, ring, queue);
+		kvfree(queue->entries);
+		queue->entries = NULL;
+	}
+	if (queue->completion_pool) {
+		kfree(queue->completion_pool);
+		queue->completion_pool = NULL;
+	}
+	if (queue->page_list_pool) {
+		kfree(queue->page_list_pool);
+		queue->page_list_pool = NULL;
+	}
+	memset(queue, 0, sizeof(*queue));
+}
 
 /** ndma_calc_zc_pin_size()
  *
@@ -960,7 +1390,7 @@ bool ndma_zerocopy_supported(void)
  *     Think about using some permanent location in HBM as source for completion descriptor update.  Like
  *     why are we reading across the PCIe bus to fetch completion data.
  */
-static int ndma_build_n_issue_zc_descs( struct ndma_h2t_zcdma_context * dma_ctx)
+static int ndma_build_n_issue_zc_descs(struct ndma_h2t_zcdma_context * dma_ctx)
 {
 	int            ret;
 	unsigned long  offset        = (unsigned long)(dma_ctx->host_addr) & (PAGE_SIZE-1);
@@ -970,7 +1400,7 @@ static int ndma_build_n_issue_zc_descs( struct ndma_h2t_zcdma_context * dma_ctx)
 	int            i = 0;
 	u64            chunk_size;
 	int            pending_transfers = 0;
-	int barrier_type;
+	int            barrier_type;
 
 	while (i < dma_ctx->nr_pages) {
 		dma_addr_t src_addr;
@@ -1035,7 +1465,7 @@ static int ndma_build_n_issue_zc_descs( struct ndma_h2t_zcdma_context * dma_ctx)
 			pending_transfers++;
 		}
 	}
-	
+
 	dma_ctx->nr_desc = pending_transfers;
 
 	if (narch_get_arch() != NEURON_ARCH_V2)
@@ -1050,202 +1480,387 @@ static int ndma_build_n_issue_zc_descs( struct ndma_h2t_zcdma_context * dma_ctx)
 	pending_transfers++;
 
 	ret = udma_m2m_copy_start(&dma_ctx->eng->udma, dma_ctx->ring->qid, pending_transfers, pending_transfers);
-
 	if (ret) {
 		pr_info("copy start failed %d\n", ret);
 	}
+	dma_ctx->state = NDMA_SUBMITTED;
 
 error:
 	return ret;
 }
 
-/**
- * ndma_zerocopy_wait_for_completion()
- *
- *
- *
- */
-static int ndma_zerocopy_wait_for_completion( struct neuron_device *nd, u32 nc_id, struct ndma_eng   *eng, struct ndma_ring  *ring,
-											  struct ndma_h2t_zcdma_context * dma_ctx, struct ndma_h2t_zcdma_context * ndma_ctx)
+/* Return the number of descriptors available (TX-only; TX/RX counts match) */
+static u32 ndma_zc_descs_available(struct ndma_eng *eng, u32 qid)
 {
-	int  ret;
+	struct udma_q *txq;
+	u32 tx_desc_available;
 
-	ret = ndma_memcpy_wait_for_completion(eng, ring, dma_ctx->nr_desc+1, dma_ctx->completion_ptr, true, false);
-	//atomic_sub(dma_ctx->nr_desc+1, &dma_ctx->ring->h2t_outstanding_desc);
+	udma_q_handle_get(&eng->udma, qid, UDMA_TX, &txq);
 
-	if (ret == 0) {
-		if (dma_ctx->direction)
-			unpin_user_pages(dma_ctx->page_list, dma_ctx->nr_pages);
-		else
-			unpin_user_pages_dirty_lock(dma_ctx->page_list, dma_ctx->nr_pages, true);
-		return ret;
+	tx_desc_available = udma_available_get(txq);
+
+	/* TX/RX descriptor availability is kept in lock-step. */
+	return tx_desc_available;
+}
+
+/* Estimate if a zero-copy DMA context fits in the available descriptors. */
+static bool _ndma_zc_descs_available(struct ndma_eng *eng, u32 qid, u32 threshold)
+{
+	u32 max_descs_required = threshold + 1; /* +1 for completion descriptor */
+
+	return ndma_zc_descs_available(eng, qid) >= max_descs_required;
+}
+
+/* Whether we should wait for some completions before submitting more in the next iteration */
+static bool ndma_zc_should_wait(struct ndma_eng *eng,
+								struct ndma_ring *ring,
+								struct ndma_ctx_queue *ctx_queue,
+								u32 *desc_threshold)
+{
+	bool pinned_at_max;
+	bool desc_ring_full;
+	bool ctx_queue_full;
+
+	pinned_at_max = ctx_queue->nr_pinned_pages >= NDMA_CTX_QUEUE_MAX_PINNED_PAGES;
+	ctx_queue_full = ndma_ctx_queue_is_full(ctx_queue);
+	desc_ring_full = !_ndma_zc_descs_available(eng, ring->qid, *desc_threshold);
+
+	if (pinned_at_max || desc_ring_full || ctx_queue_full) {
+		*desc_threshold = NDMA_ZC_DESC_WAIT_THRESHOLD_HI;
+		return true;
 	}
 
-	// If we are exiting here, we've failed so unpin pages associated with the DMA.  If the next DMA
-	// context is valid, do an obligatory wait for the DMA operation so we don't splat data on someone 
-	// else's memory just in case the physical pages are reassigned after unpinning.
-	//
-	unpin_user_pages(dma_ctx->page_list, dma_ctx->nr_pages);
+	return false;
+}
 
-	// blindly wait
-	if (ndma_ctx != NULL) {
-		ndma_memcpy_wait_for_completion(eng, ring, ndma_ctx->nr_desc+1, ndma_ctx->completion_ptr, false, false);
-		unpin_user_pages(ndma_ctx->page_list, ndma_ctx->nr_pages);
+static int ndma_zerocopy_pin_pages(int nd_id,
+								   u32 nc_id,
+								   struct ndma_ctx_queue *ctx_queue,
+								   struct ndma_h2t_zcdma_context *dma_ctx,
+								   bool use_remote_pin)
+{
+	int nr_pinned = 0;
+
+	if (use_remote_pin) {
+		if (!dma_ctx->mm) {
+			pr_err("remote pin requested without mm context\n");
+			return -EINVAL;
+		}
+#if (!defined(RHEL_RELEASE_CODE) && (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0))) || (defined(RHEL_RELEASE_CODE) && (RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9, 6)))
+		nr_pinned = pin_user_pages_remote(dma_ctx->mm,
+										(unsigned long)dma_ctx->host_addr & PAGE_MASK,
+										dma_ctx->nr_pages,
+										dma_ctx->direction ? 0 : FOLL_WRITE,
+										dma_ctx->page_list,
+										NULL);
+#else
+		nr_pinned = pin_user_pages_remote(dma_ctx->mm,
+										(unsigned long)dma_ctx->host_addr & PAGE_MASK,
+										dma_ctx->nr_pages,
+										dma_ctx->direction ? 0 : FOLL_WRITE,
+										dma_ctx->page_list,
+										NULL,
+										NULL);
+#endif
+		mmput(dma_ctx->mm);
+		dma_ctx->mm = NULL;
+	} else {
+		nr_pinned = pin_user_pages_fast((unsigned long)dma_ctx->host_addr & PAGE_MASK, dma_ctx->nr_pages,
+							dma_ctx->direction ? 0 : FOLL_WRITE, dma_ctx->page_list);
+
+		if (nr_pinned != dma_ctx->nr_pages) {
+			// if failed pin_fast because of page fault, do the regular pinning
+			if (nr_pinned > 0) {
+				unpin_user_pages(dma_ctx->page_list, nr_pinned);
+			}
+
+#if (!defined(RHEL_RELEASE_CODE) && (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0))) || (defined(RHEL_RELEASE_CODE) && (RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9, 6)))
+			nr_pinned = pin_user_pages((unsigned long)dma_ctx->host_addr & PAGE_MASK, dma_ctx->nr_pages, dma_ctx->direction ? 0 : FOLL_WRITE, dma_ctx->page_list);
+#else
+			nr_pinned = pin_user_pages((unsigned long)dma_ctx->host_addr & PAGE_MASK, dma_ctx->nr_pages, dma_ctx->direction ? 0 : FOLL_WRITE, dma_ctx->page_list, NULL);
+#endif
+		}
 	}
-	
+
+	if (nr_pinned != dma_ctx->nr_pages) {
+		int err = (nr_pinned < 0) ? nr_pinned : -ENOMEM;
+
+		pr_err("could not pin host pages for zero copy dma on nd %d: nr_pinned %d\n", nd_id, nr_pinned);
+
+		if (nr_pinned > 0) {
+			unpin_user_pages(dma_ctx->page_list, nr_pinned);
+		}
+
+		return err;
+	}
+
+	ctx_queue->nr_pinned_pages += dma_ctx->nr_pages;
+	dma_ctx->state = NDMA_PINNED_UNSUBMITTED;
+
+	return 0;
+}
+
+int ndma_zerocopy_submit(struct neuron_device *nd,
+			 u32 nc_id,
+			 const nrt_tensor_batch_op_t *ops,
+			 u32 num_ops,
+			 dma_addr_t dev_base,
+			 int qid,
+			 bool direction,
+			 u64 sequence_num)
+{
+	int ret = 0;
+	int i = 0;
+	const int eng_id = ndhal->ndhal_ndmar.ndmar_get_h2t_eng_id(nd, nc_id);
+	struct ndma_eng *eng = &nd->ndma_engine[eng_id];
+	struct ndma_queue *queue = &eng->queues[qid];
+	struct ndma_ring *ring = &queue->ring_info;
+	struct ndma_ctx_queue *ctx_queue = &ring->dma_ctx_queue;
+	struct ndma_h2t_zcdma_context *cur_ctx = NULL;
+	struct ndma_h2t_zcdma_op_context op_ctx;
+	bool async = (sequence_num != 0);
+
+	/* Verify ring ownership. */
+	if (!ndmar_h2t_ring_is_owner(ring, nc_id)) {
+		pr_err("nd%02d: attempting to use qid %d that was not assigned to nc %d\n",
+		       nd->device_index, qid, nc_id);
+		return -ENOENT;
+	}
+
+	mutex_lock(&ring->h2t_ring_lock);
+
+	for (i = 0; i < num_ops; i++) {
+		const nrt_tensor_batch_op_t *op = &ops[i];
+		op_ctx.host_addr = op->buffer;
+		op_ctx.dev_addr = dev_base + op->offset;
+		op_ctx.offset = (unsigned long)op_ctx.host_addr & (PAGE_SIZE - 1);
+		op_ctx.remaining = op->size;
+		/* pin_size is in page units; include the page offset. */
+		op_ctx.pin_size = ndma_calc_zc_pin_size(op_ctx.remaining + op_ctx.offset);
+
+		while (op_ctx.remaining) {
+			int nr_pages;
+			bool can_pin;
+			bool ctx_queue_full;
+
+			/* Step 1: submit any pinned contexts that have available descriptors. */
+			while (true) {
+				struct ndma_h2t_zcdma_context *unsubmitted_ctx = ndma_ctx_queue_peek_pinned_unsubmitted(ctx_queue);
+
+				if (!unsubmitted_ctx || !_ndma_zc_descs_available(eng, ring->qid, unsubmitted_ctx->nr_pages)) {
+					break;
+				}
+
+				ret = ndma_build_n_issue_zc_descs(unsubmitted_ctx);
+				if (ret) {
+					pr_err("failed to build and issue zero-copy descs\n");
+					goto done;
+				}
+
+				ndma_ctx_queue_inc_first_pinned_unsubmitted(ctx_queue);
+			}
+
+			/* Step 2: set up the current ctx if there is room and pinned-page budget. */
+			nr_pages = DIV_ROUND_UP(op_ctx.pin_size, PAGE_SIZE);
+			can_pin = (ctx_queue->nr_pinned_pages + nr_pages <= NDMA_CTX_QUEUE_MAX_PINNED_PAGES);
+			ctx_queue_full = ndma_ctx_queue_is_full(ctx_queue);
+
+			if (async && ctx_queue_full) {
+				pr_err("ctx queue full. failed to submit async ctx\n");
+				ret = -EBUSY;
+				goto done;
+			}
+
+			if ((can_pin || async) && !ctx_queue_full) {
+				cur_ctx                 = ndma_ctx_queue_peek_tail(ctx_queue);
+				cur_ctx->eng            = eng;
+				cur_ctx->ring           = ring;
+				cur_ctx->host_addr      = op_ctx.host_addr;
+				cur_ctx->dev_addr       = op_ctx.dev_addr;
+				// First chunk may be unaligned; later chunks are page-aligned with offset=0.
+				cur_ctx->size           = op_ctx.pin_size - op_ctx.offset;
+				cur_ctx->direction      = direction;
+				cur_ctx->last           = (cur_ctx->size == op_ctx.remaining && i == num_ops - 1);
+				cur_ctx->nr_pages       = nr_pages;
+				cur_ctx->state          = NDMA_UNPINNED;
+				cur_ctx->nr_desc        = 0; // Set by ndma_build_n_issue_zc_descs().
+				cur_ctx->mm             = NULL;
+				cur_ctx->sequence_num   = sequence_num;
+
+				/* Pin now if possible; otherwise capture mm for remote pinning (async only). */
+				if (can_pin) {
+					ret = ndma_zerocopy_pin_pages(nd->device_index, nc_id, ctx_queue, cur_ctx, false);
+					if (ret) {
+						pr_err("failed to pin pages for zero copy dma on nd %d\n", nd->device_index);
+						goto done;
+					}
+				} else if (async) {
+					struct mm_struct *mm = current->mm;
+					mmget(mm);
+					cur_ctx->mm = mm;
+				}
+
+				/* Advance the queue tail.
+				 * May also initialize/advance the pinned+unsubmitted and unpinned pointers.
+				 */
+				ndma_ctx_queue_inc_tail(ctx_queue);
+
+				/* Update loop variables for the next chunk. */
+				op_ctx.remaining -= cur_ctx->size;
+				op_ctx.host_addr += cur_ctx->size;
+				op_ctx.dev_addr += cur_ctx->size;
+				op_ctx.pin_size = (op_ctx.remaining < op_ctx.pin_size) ? op_ctx.remaining : op_ctx.pin_size;
+				op_ctx.offset = 0;
+				cur_ctx = NULL;
+			}
+
+			/* Step 3 (sync): wait for submitted transfers to complete from the head. */
+			if (!async) {
+				u32 desc_threshold = NDMA_ZC_DESC_WAIT_THRESHOLD_LO;
+
+				while (ndma_zc_should_wait(eng, ring, ctx_queue, &desc_threshold)) {
+					struct ndma_h2t_zcdma_context *submitted_ctx = ndma_ctx_queue_pop_submitted(ctx_queue);
+
+					ret = ndma_memcpy_wait_for_completion(eng, ring, submitted_ctx->nr_desc + 1,
+									      submitted_ctx->completion_ptr,
+									      true, false);
+					ndma_zc_release_ctx(submitted_ctx, &ctx_queue->nr_pinned_pages);
+					if (ret) {
+						pr_err("failed to wait for completion of zero copy dma\n");
+						goto done;
+					}
+				}
+			}
+		}
+	}
+
+	if (!async) {
+		/* Step 4 (sync): submit remaining pinned ctxs, then drain all submitted ctxs. */
+		while (true) {
+			struct ndma_h2t_zcdma_context *ctx_to_submit = ndma_ctx_queue_peek_pinned_unsubmitted(ctx_queue);
+
+			if (ctx_to_submit && _ndma_zc_descs_available(eng, ring->qid, ctx_to_submit->nr_pages)) {
+				ret = ndma_build_n_issue_zc_descs(ctx_to_submit);
+				if (ret) {
+					pr_err("failed to build and issue zero-copy descs\n");
+					goto done;
+				}
+				ndma_ctx_queue_inc_first_pinned_unsubmitted(ctx_queue);
+			}
+
+			struct ndma_h2t_zcdma_context *ctx_to_wait = ndma_ctx_queue_pop_submitted(ctx_queue);
+			if (ctx_to_wait) {
+				ret = ndma_memcpy_wait_for_completion(eng, ring, ctx_to_wait->nr_desc + 1,
+								      ctx_to_wait->completion_ptr,
+								      true, false);
+				ndma_zc_release_ctx(ctx_to_wait, &ctx_queue->nr_pinned_pages);
+				if (ret) {
+					pr_err("failed to wait for completion of zero copy dma\n");
+					goto done;
+				}
+			}
+
+			if (!ctx_to_submit && !ctx_to_wait) {
+				break;
+			}
+		}
+	}
+
+done:
+	if (ret) {
+		ndma_ctx_queue_drain(eng, ring, ctx_queue);
+	}
+	mutex_unlock(&ring->h2t_ring_lock);
 	return ret;
 }
 
-int ndma_memcpy_zerocopy(struct neuron_device *nd,
-                                u32 nc_id,
-                                const nrt_tensor_batch_op_t *ops,
-                                u32 num_ops,
-                                dma_addr_t dev_base,
-                                int qid,
-                                bool direction)
+/* The completion flow for completion, remote pinning, and submission. Async IO only */
+static __maybe_unused int ndma_zerocopy_complete(struct neuron_device *nd,
+												 struct ndma_eng *eng,
+												 struct ndma_ring *ring,
+												 bool *did_work)
 {
-    int ret = 0;
-    const int eng_id = ndhal->ndhal_ndmar.ndmar_get_h2t_eng_id(nd, nc_id);
-    struct ndma_eng   *eng   = &nd->ndma_engine[eng_id];
-    struct ndma_queue *queue = &eng->queues[qid];
-    struct ndma_ring  *ring  = &queue->ring_info;
-    struct ndma_h2t_zcdma_context   dma_ctx_tbl[2] = {0};
-    struct ndma_h2t_zcdma_context *pdma_ctx = NULL;
-    int    next_dma_idx = 0;
-    int    i            = 0;
-    bool   locked       = false;
+	int ret = 0;
+	int err = 0;
+	struct ndma_ctx_queue *ctx_queue = NULL;
+	u32 desc_threshold = NDMA_ZC_DESC_WAIT_THRESHOLD_LO;
 
-    // sanity check ring is owned by nc_id
-    if (!ndmar_h2t_ring_is_owner(ring, nc_id)) {
-        pr_err("nd%02d: attempting to use qid %d that was not assigned to nc %d\n", nd->device_index, qid, nc_id);
-        return -ENOENT;
-    }
+	if (!ring || !did_work) {
+		return -EINVAL;
+	}
+	*did_work = false;
 
-    // initialize the static fields in the dma contexts that are the same for every operation
-    for (i=0;i< 2;i++) {
-        dma_ctx_tbl[i].eng            = eng;
-        dma_ctx_tbl[i].ring           = ring;
-        dma_ctx_tbl[i].direction      = direction;
-        dma_ctx_tbl[i].page_list      = kcalloc( NDMA_ZC_PAGES_PER_XFER, sizeof(struct page *), GFP_KERNEL);
-        dma_ctx_tbl[i].completion_ptr = kmalloc(DMA_COMPLETION_MARKER_SIZE * 2, GFP_KERNEL);
+	ctx_queue = &ring->dma_ctx_queue;
 
-        if ((dma_ctx_tbl[i].page_list == NULL) || (dma_ctx_tbl[i].completion_ptr == NULL)) {
-            pr_err("could not allocate memory for dma contexts on nd %d\n", nd->device_index);
-            ret = -ENOMEM;
-            goto fail;
-        }
-    }
-    pdma_ctx = NULL;
+	mutex_lock(&ring->h2t_ring_lock);
 
-    mutex_lock(&ring->h2t_ring_lock);
-    locked = true;
+	/* 1) Wait for at least one submitted context to complete */
+	while (true) {
+		if (ndma_ctx_queue_submitted_empty(ctx_queue)) {
+			break;
+		}
+		if (*did_work && !ndma_zc_should_wait(eng, ring, ctx_queue, &desc_threshold)) {
+			break;
+		}
+		struct ndma_h2t_zcdma_context *submitted_ctx = ndma_ctx_queue_pop_submitted(ctx_queue);
 
-    // Process all operations with pipelining
-    for (i = 0; i < num_ops; i++) {
-        const nrt_tensor_batch_op_t *op = &ops[i];
-        u64 remaining = op->size;
-        void *host_addr = op->buffer;
-        dma_addr_t dev_addr = dev_base + op->offset;
-        u64 offset = (unsigned long)host_addr & (PAGE_SIZE - 1);
-        u64 pin_size = ndma_calc_zc_pin_size(op->size + offset);  // pin size is in page units, so include the page offset in size calc
+		ret = ndma_memcpy_wait_for_completion(eng, ring, submitted_ctx->nr_desc + 1, submitted_ctx->completion_ptr, true, false);
+		if (ret) {
+			err = ret;
+			pr_err("async h2d dma completion failed for seq num %llu: %d\n", submitted_ctx->sequence_num, ret);
+			ndma_h2d_compl_queue_put(&ring->dma_compl_queue, submitted_ctx->sequence_num, ret, NULL);
+			ndma_ctx_queue_drain_sequence(ctx_queue, submitted_ctx->sequence_num);
+		} else if (submitted_ctx->last) {
+			ndma_h2d_compl_queue_put(&ring->dma_compl_queue, submitted_ctx->sequence_num, 0, NULL);
+		}
 
-        while (remaining) {
-            struct ndma_h2t_zcdma_context *dma_ctx = &dma_ctx_tbl[next_dma_idx];
-            dma_ctx->start_time = get_jiffies_64();
-            dma_ctx->host_addr  = host_addr;
-            dma_ctx->dev_addr   = dev_addr;
-            dma_ctx->size       = pin_size - offset; // first chunk might not be aligned on the page boundary, all subsequent chunk will be aligned
-                                                     // and the offset will be 0
-            dma_ctx->last       = (dma_ctx->size == remaining && i == num_ops - 1);
-            dma_ctx->nr_pages   = DIV_ROUND_UP(pin_size, PAGE_SIZE);
-            if (dma_ctx->nr_pages > NDMA_ZC_PAGES_PER_XFER) {
-                pr_err_once("page count too large: %u\n", dma_ctx->nr_pages);
-            }
+		ndma_zc_release_ctx(submitted_ctx, &ctx_queue->nr_pinned_pages);
 
-            //__GFP_SKIP_ZERO
-            int nr_pinned = pin_user_pages_fast((unsigned long)dma_ctx->host_addr & PAGE_MASK, dma_ctx->nr_pages,
-                                                direction ? 0 : FOLL_WRITE, dma_ctx->page_list);
-            if (nr_pinned != dma_ctx->nr_pages) {
-                // if failed pin_fast because of page fault, do the regular pinning
-                if (nr_pinned > 0) {
-                    unpin_user_pages( dma_ctx->page_list, nr_pinned);
-                }
+		*did_work = true;
+	}
 
-#if (!defined(RHEL_RELEASE_CODE) && (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0))) || (defined(RHEL_RELEASE_CODE) && (RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9, 6)))
-                nr_pinned = pin_user_pages((unsigned long)dma_ctx->host_addr & PAGE_MASK, dma_ctx->nr_pages, direction ? 0 : FOLL_WRITE, dma_ctx->page_list);
-#else
-                nr_pinned = pin_user_pages((unsigned long)dma_ctx->host_addr & PAGE_MASK, dma_ctx->nr_pages, direction ? 0 : FOLL_WRITE, dma_ctx->page_list, NULL);
-#endif
-                if (nr_pinned != dma_ctx->nr_pages) {
-                    ret = -ENOMEM; // could use -EBUSY instead
-                    pr_err("could not pin host pages for zero copy dma on nd %d: nr_pinned %d\n", nd->device_index, nr_pinned);
+	/* 2) Submit pinned but unsubmitted contexts */
+	while (true) {
+		struct ndma_h2t_zcdma_context *pinned_unsubmitted_ctx = ndma_ctx_queue_peek_pinned_unsubmitted(ctx_queue);
 
-                    if (nr_pinned > 0) {
-                        unpin_user_pages( dma_ctx->page_list, nr_pinned);
-                    }
-                    // cleanup: wait for prev dma to complete (which also unpins pages)
-                    if (pdma_ctx != NULL) {
-                        ndma_zerocopy_wait_for_completion( nd, nc_id, eng, ring, pdma_ctx, NULL);
-                    }
-                    goto fail;
-                }
-            }
+		if (!pinned_unsubmitted_ctx || !_ndma_zc_descs_available(eng, ring->qid, pinned_unsubmitted_ctx->nr_pages)) {
+			break;
+		}
 
-            // TODO need to have this for other architectures
-            // for (i=0; i < dma_ctx->nr_pages; i++) {
-            //     struct device
-            //      dma_ctx->addr[i] = dma_map_page( nd->pdev->dev, dma_ctx_page_list[i], 0, PAGE_SIZE, DMA_TO_DEVICE/DMA_FROM_DEVICE);
-            //      ret = dma_mapping_error(dev->dev, dma_ctx->addr[i]);
-            //      if (ret) { }
-            // }
-            // flush_cache_range(vma, 
+		ret = ndma_build_n_issue_zc_descs(pinned_unsubmitted_ctx);
+		if (ret) {
+			err = ret;
+			pr_err("async h2d dma submission failed for seq num %llu: %d\n", pinned_unsubmitted_ctx->sequence_num, ret);
+			ndma_h2d_compl_queue_put(&ring->dma_compl_queue, pinned_unsubmitted_ctx->sequence_num, ret, NULL);
+			ndma_ctx_queue_drain_sequence(ctx_queue, pinned_unsubmitted_ctx->sequence_num);
+		} else {
+			ndma_ctx_queue_inc_first_pinned_unsubmitted(ctx_queue);
+		}
 
-            ret = ndma_build_n_issue_zc_descs(dma_ctx);
-            if (ret) {
-                unpin_user_pages( dma_ctx->page_list, dma_ctx->nr_pages);
-                // cleanup: wait for prev dma to complete (which also unpins pages)
-                if (pdma_ctx != NULL) {
-                    ndma_zerocopy_wait_for_completion(nd, nc_id, eng, ring, pdma_ctx, NULL);
-                }
-                goto fail;
-            }
+		*did_work = true;
+	}
 
-            if (pdma_ctx != NULL) {
-                ret = ndma_zerocopy_wait_for_completion(nd, nc_id, eng, ring, pdma_ctx, dma_ctx);
-                if (ret) {
-                    goto fail;
-                }
-            }
+	/* 3) Remote pin unpinned contexts */
+	while (true) {
+		struct ndma_h2t_zcdma_context *unpinned_ctx = ndma_ctx_queue_peek_first_unpinned(ctx_queue);
 
-            pdma_ctx     = dma_ctx;
-            next_dma_idx = (next_dma_idx+1) % 2;
+		if (!unpinned_ctx || ctx_queue->nr_pinned_pages + unpinned_ctx->nr_pages > NDMA_CTX_QUEUE_MAX_PINNED_PAGES) {
+			break;
+		}
 
-            remaining -= dma_ctx->size;
-            host_addr += dma_ctx->size;
-            dev_addr  += dma_ctx->size;
-            pin_size   = (remaining < pin_size) ? remaining : pin_size;
-            offset     = 0;
-        }
-    }
+		ret = ndma_zerocopy_pin_pages(nd->device_index, ring->h2t_nc_id, ctx_queue, unpinned_ctx, true);
+		if (ret) {
+			err = ret;
+			pr_err("async h2d dma remote pinning failed for seq num %llu: %d\n", unpinned_ctx->sequence_num, ret);
+			ndma_h2d_compl_queue_put(&ring->dma_compl_queue, unpinned_ctx->sequence_num, ret, NULL);
+			ndma_ctx_queue_drain_sequence(ctx_queue, unpinned_ctx->sequence_num);
+		} else {
+			ndma_ctx_queue_inc_first_unpinned(ctx_queue);
+		}
 
+		*did_work = true;
+	}
 
-    // Wait for the last chunk
-    if (pdma_ctx) {
-        ret = ndma_zerocopy_wait_for_completion( nd, nc_id, eng, ring, pdma_ctx, NULL);
-    }
-
-fail:
-    // release resources
-    for (i = 0; i < 2; i++) {
-        if (dma_ctx_tbl[i].page_list != NULL)
-            kfree(dma_ctx_tbl[i].page_list);
-        if (dma_ctx_tbl[i].completion_ptr != NULL) {
-            kfree(dma_ctx_tbl[i].completion_ptr);
-        }
-    }
-    if (locked) {
-        mutex_unlock(&ring->h2t_ring_lock);
-    }
-
-    return ret;
+	mutex_unlock(&ring->h2t_ring_lock);
+	return err;
 }

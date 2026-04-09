@@ -198,7 +198,7 @@ done:
  * @param device_dram_addr: DRAM Channel 0 and 1's addresses
  * @param device_dram_size: DRAM Channel 0 and 1's sizes
  */
-static void mpset_set_dram_and_mpset_info_v4(struct mempool_set *mpset, u64 *device_dram_addr, u64 *device_dram_size)
+static void mpset_set_dram_and_mpset_info_v4(struct neuron_mempool_set *mpset, u64 *device_dram_addr, u64 *device_dram_size)
 {
 	mpset->num_channels = V4_MAX_DRAM_CHANNELS;
 	mpset->mp_device_num_regions = 1;
@@ -265,45 +265,8 @@ static int mmap_get_bar4_offset_v4(u64 start_addr, u64 size, u64 *offset)
 	return 0;
 }
 
-extern int dup_helper_enable;
-static atomic_t dup_rid_cnt = ATOMIC_INIT(0); // count of duplicate routing IDs encountered
-static int neuron_pci_handle_dup_routing_id(void)
-{
-	int  ret = -ENODEV;
-	int  dup_cnt;
-	char cmd[256];
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)
-	dup_cnt = atomic_fetch_add(1, &dup_rid_cnt);
-#else
-	dup_cnt = atomic_add_return(1, &dup_rid_cnt) - 1;
-#endif
-
-	// If this is the first dup encounted, unload the driver
-	if ((dup_cnt == 0) && dup_helper_enable) {
-		pr_err("scheduling unload of %s due to duplicate routing id\n", module_name(THIS_MODULE));
-
-		int n = snprintf(cmd, sizeof(cmd), "sleep 10;/sbin/modprobe -r %s", module_name(THIS_MODULE));
-		if (n > sizeof(cmd)) {
-			pr_err("unable to schedule driver unload cmd buffer len exceeded\n");
-			return -EINVAL;
-		}
-		char *argv[] = 		  { "/bin/sh",
-								"-c",
-								cmd,
-								NULL};
-		static char *envp[] = { "HOME=/",
-								"TERM=linux",
-								"PATH=/sbin:/usr/sbin:/bin:/usr/bin",
-								NULL};
-
-		ret = call_usermodehelper( argv[0], argv, envp, UMH_WAIT_EXEC);
-		if (ret)
-			pr_err("unable to schedule driver unload. Error: %d\n", ret);
-	}
-
-	return ret;
-}
+/* PCI Functions */
 
 // for V4 rename Neuron devices for better customer experience.
 // see internal documentation: TRN2-Discovery
@@ -373,18 +336,14 @@ static int neuron_pci_get_device_id_v4(struct neuron_device *nd, struct pci_dev 
 	}
 
 	if (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_PDS) {
-		u32 server_info = 0;
-		bool server_id_valid = 0;
-		u32 server_id = 0;
-		ret = fw_io_server_info_read(nd->npdev.bar0, &server_info);
+		int server_id;
+
+		ret = fw_io_server_info_read(nd->npdev.bar0, &server_id, NULL);
 		if (ret) {
 			return -ENODEV;
 		}
 
-		server_id_valid = (server_info >> 15) & 0x1; // TODO we probably need const shift value or macro
-		if (server_id_valid) {
-			server_id = server_info & 0x7fff; // TODO we probably need constant mask for this
-		} else {
+		if (server_id == -1) {
 			pr_err("Could not retrieve valid server id, ret = %d\n", ret);
 			return -ENODEV;
 		}
@@ -415,21 +374,21 @@ static int neuron_pci_get_device_id_v4(struct neuron_device *nd, struct pci_dev 
 #define NC_MAPPING_MAX_CORE_COUNT_V4 128
 static const struct neuron_ioctl_nc_map_entry nc_mapping_v0_seng_swap_pds[] = {
 	{ .device_id = 0,  .device_nc_idx = 4 }, { .device_id = 0,  .device_nc_idx = 5 }, { .device_id = 0,  .device_nc_idx = 6 }, { .device_id = 0,  .device_nc_idx = 7 }, { .device_id = 0,  .device_nc_idx = 2 }, { .device_id = 0,  .device_nc_idx = 3  }, { .device_id = 0,  .device_nc_idx = 0 }, { .device_id = 0,  .device_nc_idx = 1 }, // ND0
-	{ .device_id = 1,  .device_nc_idx = 2 }, { .device_id = 1,  .device_nc_idx = 3 }, { .device_id = 1,  .device_nc_idx = 0 }, { .device_id = 1,  .device_nc_idx = 1 }, { .device_id = 1,  .device_nc_idx = 4 }, { .device_id = 1,  .device_nc_idx = 5  }, { .device_id = 1,  .device_nc_idx = 6 }, { .device_id = 1,  .device_nc_idx = 7 }, // ND1
+	{ .device_id = 1,  .device_nc_idx = 6 }, { .device_id = 1,  .device_nc_idx = 7 }, { .device_id = 1,  .device_nc_idx = 4 }, { .device_id = 1,  .device_nc_idx = 5 }, { .device_id = 1,  .device_nc_idx = 0 }, { .device_id = 1,  .device_nc_idx = 1  }, { .device_id = 1,  .device_nc_idx = 2 }, { .device_id = 1,  .device_nc_idx = 3 }, // ND1
 	{ .device_id = 2,  .device_nc_idx = 4 }, { .device_id = 2,  .device_nc_idx = 5 }, { .device_id = 2,  .device_nc_idx = 6 }, { .device_id = 2,  .device_nc_idx = 7 }, { .device_id = 2,  .device_nc_idx = 2 }, { .device_id = 2,  .device_nc_idx = 3  }, { .device_id = 2,  .device_nc_idx = 0 }, { .device_id = 2,  .device_nc_idx = 1 }, // ND2
-	{ .device_id = 3,  .device_nc_idx = 2 }, { .device_id = 3,  .device_nc_idx = 3 }, { .device_id = 3,  .device_nc_idx = 0 }, { .device_id = 3,  .device_nc_idx = 1 }, { .device_id = 3,  .device_nc_idx = 4 }, { .device_id = 3,  .device_nc_idx = 5  }, { .device_id = 3,  .device_nc_idx = 6 }, { .device_id = 3,  .device_nc_idx = 7 }, // ND3
+	{ .device_id = 3,  .device_nc_idx = 6 }, { .device_id = 3,  .device_nc_idx = 7 }, { .device_id = 3,  .device_nc_idx = 4 }, { .device_id = 3,  .device_nc_idx = 5 }, { .device_id = 3,  .device_nc_idx = 0 }, { .device_id = 3,  .device_nc_idx = 1  }, { .device_id = 3,  .device_nc_idx = 2 }, { .device_id = 3,  .device_nc_idx = 3 }, // ND3
 	{ .device_id = 4,  .device_nc_idx = 4 }, { .device_id = 4,  .device_nc_idx = 5 }, { .device_id = 4,  .device_nc_idx = 6 }, { .device_id = 4,  .device_nc_idx = 7 }, { .device_id = 4,  .device_nc_idx = 2 }, { .device_id = 4,  .device_nc_idx = 3  }, { .device_id = 4,  .device_nc_idx = 0 }, { .device_id = 4,  .device_nc_idx = 1 }, // ND4
-	{ .device_id = 5,  .device_nc_idx = 2 }, { .device_id = 5,  .device_nc_idx = 3 }, { .device_id = 5,  .device_nc_idx = 0 }, { .device_id = 5,  .device_nc_idx = 1 }, { .device_id = 5,  .device_nc_idx = 4 }, { .device_id = 5,  .device_nc_idx = 5  }, { .device_id = 5,  .device_nc_idx = 6 }, { .device_id = 5,  .device_nc_idx = 7 }, // ND5
+	{ .device_id = 5,  .device_nc_idx = 6 }, { .device_id = 5,  .device_nc_idx = 7 }, { .device_id = 5,  .device_nc_idx = 4 }, { .device_id = 5,  .device_nc_idx = 5 }, { .device_id = 5,  .device_nc_idx = 0 }, { .device_id = 5,  .device_nc_idx = 1  }, { .device_id = 5,  .device_nc_idx = 2 }, { .device_id = 5,  .device_nc_idx = 3 }, // ND5
 	{ .device_id = 6,  .device_nc_idx = 4 }, { .device_id = 6,  .device_nc_idx = 5 }, { .device_id = 6,  .device_nc_idx = 6 }, { .device_id = 6,  .device_nc_idx = 7 }, { .device_id = 6,  .device_nc_idx = 2 }, { .device_id = 6,  .device_nc_idx = 3  }, { .device_id = 6,  .device_nc_idx = 0 }, { .device_id = 6,  .device_nc_idx = 1 }, // ND6
-	{ .device_id = 7,  .device_nc_idx = 2 }, { .device_id = 7,  .device_nc_idx = 3 }, { .device_id = 7,  .device_nc_idx = 0 }, { .device_id = 7,  .device_nc_idx = 1 }, { .device_id = 7,  .device_nc_idx = 4 }, { .device_id = 7,  .device_nc_idx = 5  }, { .device_id = 7,  .device_nc_idx = 6 }, { .device_id = 7,  .device_nc_idx = 7 }, // ND7
+	{ .device_id = 7,  .device_nc_idx = 6 }, { .device_id = 7,  .device_nc_idx = 7 }, { .device_id = 7,  .device_nc_idx = 4 }, { .device_id = 7,  .device_nc_idx = 5 }, { .device_id = 7,  .device_nc_idx = 0 }, { .device_id = 7,  .device_nc_idx = 1  }, { .device_id = 7,  .device_nc_idx = 2 }, { .device_id = 7,  .device_nc_idx = 3 }, // ND7
 	{ .device_id = 8,  .device_nc_idx = 4 }, { .device_id = 8,  .device_nc_idx = 5 }, { .device_id = 8,  .device_nc_idx = 6 }, { .device_id = 8,  .device_nc_idx = 7 }, { .device_id = 8,  .device_nc_idx = 2 }, { .device_id = 8,  .device_nc_idx = 3  }, { .device_id = 8,  .device_nc_idx = 0 }, { .device_id = 8,  .device_nc_idx = 1 }, // ND8
-	{ .device_id = 9,  .device_nc_idx = 2 }, { .device_id = 9,  .device_nc_idx = 3 }, { .device_id = 9,  .device_nc_idx = 0 }, { .device_id = 9,  .device_nc_idx = 1 }, { .device_id = 9,  .device_nc_idx = 4 }, { .device_id = 9,  .device_nc_idx = 5  }, { .device_id = 9,  .device_nc_idx = 6 }, { .device_id = 9,  .device_nc_idx = 7 }, // ND9
+	{ .device_id = 9,  .device_nc_idx = 6 }, { .device_id = 9,  .device_nc_idx = 7 }, { .device_id = 9,  .device_nc_idx = 4 }, { .device_id = 9,  .device_nc_idx = 5 }, { .device_id = 9,  .device_nc_idx = 0 }, { .device_id = 9,  .device_nc_idx = 1  }, { .device_id = 9,  .device_nc_idx = 2 }, { .device_id = 9,  .device_nc_idx = 3 }, // ND9
 	{ .device_id = 10, .device_nc_idx = 4 }, { .device_id = 10, .device_nc_idx = 5 }, { .device_id = 10, .device_nc_idx = 6 }, { .device_id = 10, .device_nc_idx = 7 }, { .device_id = 10, .device_nc_idx = 2 }, { .device_id = 10, .device_nc_idx = 3  }, { .device_id = 10, .device_nc_idx = 0 }, { .device_id = 10, .device_nc_idx = 1 }, // ND10
-	{ .device_id = 11, .device_nc_idx = 2 }, { .device_id = 11, .device_nc_idx = 3 }, { .device_id = 11, .device_nc_idx = 0 }, { .device_id = 11, .device_nc_idx = 1 }, { .device_id = 11, .device_nc_idx = 4 }, { .device_id = 11, .device_nc_idx = 5  }, { .device_id = 11, .device_nc_idx = 6 }, { .device_id = 11, .device_nc_idx = 7 }, // ND11
+	{ .device_id = 11, .device_nc_idx = 6 }, { .device_id = 11, .device_nc_idx = 7 }, { .device_id = 11, .device_nc_idx = 4 }, { .device_id = 11, .device_nc_idx = 5 }, { .device_id = 11, .device_nc_idx = 0 }, { .device_id = 11, .device_nc_idx = 1  }, { .device_id = 11, .device_nc_idx = 2 }, { .device_id = 11, .device_nc_idx = 3 }, // ND11
 	{ .device_id = 12, .device_nc_idx = 4 }, { .device_id = 12, .device_nc_idx = 5 }, { .device_id = 12, .device_nc_idx = 6 }, { .device_id = 12, .device_nc_idx = 7 }, { .device_id = 12, .device_nc_idx = 2 }, { .device_id = 12, .device_nc_idx = 3  }, { .device_id = 12, .device_nc_idx = 0 }, { .device_id = 12, .device_nc_idx = 1 }, // ND12
-	{ .device_id = 13, .device_nc_idx = 2 }, { .device_id = 13, .device_nc_idx = 3 }, { .device_id = 13, .device_nc_idx = 0 }, { .device_id = 13, .device_nc_idx = 1 }, { .device_id = 13, .device_nc_idx = 4 }, { .device_id = 13, .device_nc_idx = 5  }, { .device_id = 13, .device_nc_idx = 6 }, { .device_id = 13, .device_nc_idx = 7 }, // ND13
+	{ .device_id = 13, .device_nc_idx = 6 }, { .device_id = 13, .device_nc_idx = 7 }, { .device_id = 13, .device_nc_idx = 4 }, { .device_id = 13, .device_nc_idx = 5 }, { .device_id = 13, .device_nc_idx = 0 }, { .device_id = 13, .device_nc_idx = 1  }, { .device_id = 13, .device_nc_idx = 2 }, { .device_id = 13, .device_nc_idx = 3 }, // ND13
 	{ .device_id = 14, .device_nc_idx = 4 }, { .device_id = 14, .device_nc_idx = 5 }, { .device_id = 14, .device_nc_idx = 6 }, { .device_id = 14, .device_nc_idx = 7 }, { .device_id = 14, .device_nc_idx = 2 }, { .device_id = 14, .device_nc_idx = 3  }, { .device_id = 14, .device_nc_idx = 0 }, { .device_id = 14, .device_nc_idx = 1 }, // ND14
-	{ .device_id = 15, .device_nc_idx = 2 }, { .device_id = 15, .device_nc_idx = 3 }, { .device_id = 15, .device_nc_idx = 0 }, { .device_id = 15, .device_nc_idx = 1 }, { .device_id = 15, .device_nc_idx = 4 }, { .device_id = 15, .device_nc_idx = 5  }, { .device_id = 15, .device_nc_idx = 6 }, { .device_id = 15, .device_nc_idx = 7 }, // ND15
+	{ .device_id = 15, .device_nc_idx = 6 }, { .device_id = 15, .device_nc_idx = 7 }, { .device_id = 15, .device_nc_idx = 4 }, { .device_id = 15, .device_nc_idx = 5 }, { .device_id = 15, .device_nc_idx = 0 }, { .device_id = 15, .device_nc_idx = 1  }, { .device_id = 15, .device_nc_idx = 2 }, { .device_id = 15, .device_nc_idx = 3 }, // ND15
 };
 
 #define NC_MAPPING_V0_SENG_SWAP_SIZE (sizeof(nc_mapping_v0_seng_swap_pds) / sizeof(nc_mapping_v0_seng_swap_pds[0]))
@@ -457,6 +416,11 @@ static int ncdev_logical_to_physical_nc_map_v4(struct neuron_ioctl_nc_map *map, 
 	return 0;
 }
 
+static void perf_update_hbm_7200_supported_v4(struct neuron_device *nd) {
+	nd->supports_hbm_7200 = 0;
+	return;
+}
+
 /**
  * ndhal_register_funcs_v4() - initialize the dhal for v4 chips
  *
@@ -478,6 +442,7 @@ int ndhal_register_funcs_v4(void) {
 	ndhal->ndhal_mmap.dm_mmap_special = dm_mmap_special_v4;
 	ndhal->ndhal_mmap.mmap_get_bar4_offset = mmap_get_bar4_offset_v4;
 	ndhal->ndhal_cdev.ncdev_mem_regions = ncdev_mem_regions_v4;
+	ndhal->ndhal_perf.perf_update_hbm_7200_supported = perf_update_hbm_7200_supported_v4;
 
 	if (narch_is_emu()) {
 		// Temporarily disable resets on emulation until support is ready

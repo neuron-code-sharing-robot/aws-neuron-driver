@@ -113,12 +113,13 @@ bool nr_op_in_reset_wnd(uint64_t op_start_time, struct neuron_device *nd);
  * 
  * @nd: Neuron device structure
  * @nc_map: Neural Core map that specifies reset scope (device vs TPB level)
- * @tpb_reset_map: Bitmap of TPBs to reset
+ * @tpb_reset_map_lo: Bitmap of TPBs/SDMA/TopSp/CC_TOP to reset (bits 0-31)
+ * @tpb_reset_map_hi: Bitmap of top-level H2D DMAs to reset (bits 0-3)
  * 
  * @return: 0 on success, -1 on failure or interruption
  * 
  */
-int nr_initiate_reset_via_fw(struct neuron_device *nd, uint32_t nc_map, uint32_t tpb_reset_map);
+int nr_initiate_reset_via_fw(struct neuron_device *nd, uint32_t nc_map, uint32_t tpb_reset_map_lo, uint32_t tpb_reset_map_hi);
 
 /**
  * nr_msleep_stoppable() - Sleep until msec or reset thread is stopped

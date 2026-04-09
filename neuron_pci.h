@@ -26,6 +26,13 @@ extern int wc_enable;
 struct neuron_device *neuron_pci_get_device(u8 device_index);
 
 /**
+ * neuron_pci_handle_dup_routing_id() - Handle the case where multiple devices share the same routing id
+ *
+ * Return: 0 if successful, a negative error code otherwise.
+ */
+int neuron_pci_handle_dup_routing_id(void);
+
+/**
  * neuron_pci_module_init() - Initialize Neuron PCI driver.
  *
  * Return: 0 if initialization succeeds, a negative error code otherwise. 

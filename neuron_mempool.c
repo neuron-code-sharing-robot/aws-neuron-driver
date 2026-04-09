@@ -133,7 +133,7 @@ static void mc_remove_node(struct rb_root *root, struct mem_chunk *mc)
  * Return: 0 if pool is created, a negative error code otherwise.
  */
 
-static int mp_init_device_mem(struct mempool *mp, struct mempool_set *mpset,
+static int mp_init_device_mem(struct neuron_mempool *mp, struct neuron_mempool_set *mpset,
 			      u64 start_addr, size_t pool_size,	u32 dram_channel, u32 dram_region)
 {
 	int ret;
@@ -205,7 +205,7 @@ static int mp_init_device_mem(struct mempool *mp, struct mempool_set *mpset,
  * Frees all backing pages allocated for reserved host_mem pool.
  * Does opposite work of mp_init_hrm_pool
  */
-static void mp_destroy_hrm_pool(struct mempool *mp)
+static void mp_destroy_hrm_pool(struct neuron_mempool *mp)
 {
 	int i = 0;
 	if (mp->page_va_array == NULL)
@@ -232,13 +232,13 @@ static void mp_destroy_hrm_pool(struct mempool *mp)
  * Any page allocation failure is ignored.
  *
  * @mp: pointer to mempool that needs to be initialized
- * @mpset: pointer to parent mempool_set
+ * @mpset: pointer to parent neuron_mempool_set
  * @page_size: backing host memory's page size
  * @page_count: Max number of pages to allocate
  *
  * Return: 0 if pool is created, a negative error code otherwise.
  */
-static int mp_init_hrm_pool(struct mempool *mp, struct mempool_set *mpset,
+static int mp_init_hrm_pool(struct neuron_mempool *mp, struct neuron_mempool_set *mpset,
 			    u32 page_size, u32 page_count)
 {
 	int ret;
@@ -299,7 +299,7 @@ fail:
 /**
  * Frees all the chunks associated with the mempool and releases the mempool.
  */
-static void mp_destroy_gen_pool(struct mempool *mp)
+static void mp_destroy_gen_pool(struct neuron_mempool *mp)
 {
 	BUG_ON(mp == NULL);
 	if (!mp->initialized)
@@ -315,6 +315,58 @@ static void mp_destroy_gen_pool(struct mempool *mp)
 	}
 }
 
+// Upper 16MB is used internally by the firmware, don't use it in the allocation pool
+#define MEMPOOL_CARVEOUT_SIZE 0x1000000 // 16MB
+/**
+ * mpset_block_carveout_regions()
+ *
+ * @param nd: neuron device
+ * @param mpset: pointer to mpset
+ * @param device_dram_addr: DRAM Channel addresses
+ * @param device_dram_size: DRAM Channel sizes
+ * @return int: 0 on success, o/w on failure
+ */
+static int mpset_block_carveout_regions(struct neuron_device *nd, struct neuron_mempool_set *mpset, u64 *device_dram_addr, u64 *device_dram_size)
+{
+	int ret;
+	u64 region_sz;
+	int channel = 0, region = 0;
+
+	/*
+	*  Block carve out regions: Upper 16 MB is used internally by firmware
+	*
+	*  Ideally we would carve out by simply changing the start address of the chunk;
+	*  however, that breaks aligned allocation in 4.x kernel versions (fixed in 5.x).
+	*  Fix here:
+	*     commit 52fbf1134d479234d7e64ba9dcbaea23405f229e
+	*     Author: Alexey Skidanov <alexey.skidanov@intel.com>
+	*     Date:   Thu Jan 3 15:26:44 2019 -0800
+	*
+	*     lib/genalloc.c: fix allocation of aligned buffer from non-aligned chunk
+	*/
+	for (channel = 0; channel < mpset->num_channels; channel++) {
+		region_sz = device_dram_size[channel] / mpset->mp_device_num_regions;
+		for (region = 0; region < mpset->mp_device_num_regions; region++) {
+			const dma_addr_t start_addr = device_dram_addr[channel] + (region * region_sz);
+			struct mem_chunk *mc = NULL;
+			u32 nc_id = channel;
+			ret = mc_alloc_align(nd, MC_LIFESPAN_DEVICE, MEMPOOL_CARVEOUT_SIZE, 0, MEM_LOC_DEVICE, channel, region, nc_id, NEURON_MEMALLOC_TYPE_NCDEV_DEVICE, &mc);
+			if (ret) {
+				pr_err("failed to allocate hbm carveout region: ret=%d\n", ret);
+				return -ENOMEM;
+			}
+			if (mc->pa != start_addr) {
+				pr_err("carve out mc not offset 0!");
+				mc_free(&mc);
+				return -EINVAL;
+			}
+		}
+		ndhal->ndhal_mpset.device_dram_effective_base_addr[channel] = device_dram_addr[channel] + MEMPOOL_CARVEOUT_SIZE;
+	}
+
+	return 0;
+}
+
 /**
  * mpset_init_device_pools() - Prepare device mp in given mpset.
  *
@@ -323,7 +375,7 @@ static void mp_destroy_gen_pool(struct mempool *mp)
  *
  * Return: 0 if initialization succeeds, a negative error code otherwise.
  */
-static int mpset_init_device_pools(struct mempool_set *mpset, struct neuron_device *nd)
+static int mpset_init_device_pools(struct neuron_mempool_set *mpset, struct neuron_device *nd)
 {
 	int ret;
 	int channel = 0, region = 0;
@@ -345,7 +397,7 @@ static int mpset_init_device_pools(struct mempool_set *mpset, struct neuron_devi
 		}
 	}
 
-	ret = ndhal->ndhal_mpset.mpset_block_carveout_regions(nd, mpset, device_dram_addr, device_dram_size);
+	ret = mpset_block_carveout_regions(nd, mpset, device_dram_addr, device_dram_size);
 	if (ret) {
 		goto fail;
 	}
@@ -358,7 +410,7 @@ fail:
 			mp_destroy_gen_pool(&mpset->mp_device[channel][region]);
 		}
 	}
-	memset(mpset, 0, sizeof(struct mempool_set));
+	memset(mpset, 0, sizeof(struct neuron_mempool_set));
 
 	return ret;
 }
@@ -383,7 +435,7 @@ static int mpset_print_lifespan_list(const char *name, struct list_head *head)
 
 /** Verifies all MC allocated from the mpset is freed.
  */
-static void mpset_verify_all_mc_freed(struct mempool_set *mpset)
+static void mpset_verify_all_mc_freed(struct neuron_mempool_set *mpset)
 {
 	int i, count;
 	count = mpset_print_lifespan_list("LOCAL", &mpset->mc_lifespan_local_head);
@@ -396,7 +448,7 @@ static void mpset_verify_all_mc_freed(struct mempool_set *mpset)
 	BUG_ON(count != 0);
 }
 
-int mpset_constructor(struct mempool_set *mpset, void *pdev, struct neuron_device *nd)
+int mpset_constructor(struct neuron_mempool_set *mpset, void *pdev, struct neuron_device *nd)
 {
 	int host_page_index;
 	u64 host_allocated_size = 0;
@@ -442,9 +494,9 @@ fail:
 }
 
 static void mpset_free_lifespan_list(struct list_head *head, struct list_head *new_head);
-static struct list_head * mpset_get_lifespan_head(struct mempool_set *mpset, enum mc_lifespan lifespan);
+static struct list_head * mpset_get_lifespan_head(struct neuron_mempool_set *mpset, enum mc_lifespan lifespan);
 
-void mpset_destructor(struct mempool_set *mpset)
+void mpset_destructor(struct neuron_mempool_set *mpset)
 {
 	int i, channel, region;
 	struct list_head *head;
@@ -477,7 +529,7 @@ void mpset_destructor(struct mempool_set *mpset)
 	mutex_unlock(&mpset->lock);
 }
 
-struct mem_chunk *mpset_search_mc(struct mempool_set *mp, phys_addr_t pa)
+struct mem_chunk *mpset_search_mc(struct neuron_mempool_set *mp, phys_addr_t pa)
 {
 	struct rb_node *node = mp->root.rb_node; /* top of the tree */
 
@@ -495,7 +547,7 @@ struct mem_chunk *mpset_search_mc(struct mempool_set *mp, phys_addr_t pa)
 	return NULL;
 }
 
-static inline struct list_head * mpset_get_lifespan_head(struct mempool_set *mpset, enum mc_lifespan lifespan)
+static inline struct list_head * mpset_get_lifespan_head(struct neuron_mempool_set *mpset, enum mc_lifespan lifespan)
 {
 	struct list_head *head = NULL;
 	if (lifespan == MC_LIFESPAN_LOCAL) {
@@ -514,7 +566,7 @@ static inline struct list_head * mpset_get_lifespan_head(struct mempool_set *mps
 
 static void mc_add_to_lifespan_list(struct mem_chunk *mc)
 {
-	struct mempool_set *mpset = mc->mpset;
+	struct neuron_mempool_set *mpset = mc->mpset;
 	struct list_head *head;
 	head = mpset_get_lifespan_head(mpset, mc->lifespan);
 	list_add(&mc->lifespan_list, head);
@@ -554,7 +606,7 @@ static void mpset_free_lifespan_list(struct list_head *head, struct list_head *n
 	}
 }
 
-void mpset_free_expired_mc(struct mempool_set *mpset, enum mc_lifespan lifespan)
+void mpset_free_expired_mc(struct neuron_mempool_set *mpset, enum mc_lifespan lifespan)
 {
 	struct list_head *head, *next_head;
 	head = mpset_get_lifespan_head(mpset, lifespan);
@@ -562,7 +614,7 @@ void mpset_free_expired_mc(struct mempool_set *mpset, enum mc_lifespan lifespan)
 	mpset_free_lifespan_list(head, next_head);
 }
 
-static inline u64 get_offset_for_scratchpad_alloc(const struct mempool *mp, u64 alloc_size)
+static inline u64 get_offset_for_scratchpad_alloc(const struct neuron_mempool *mp, u64 alloc_size)
 {
 	/*
 	Contiguous scratchpad grows backwards from the end of the main genpool
@@ -581,8 +633,8 @@ static int mc_alloc_internal(struct neuron_device *nd, enum mc_lifespan lifespan
 	     struct mem_chunk **result)
 {
 	struct mem_chunk *mc;
-	struct mempool *mp = NULL;
-	struct mempool_set *mpset = &nd->mpset;
+	struct neuron_mempool *mp = NULL;
+	struct neuron_mempool_set *mpset = &nd->mpset;
 	struct gen_pool *pool = NULL;
 	struct gen_pool *alt_pool = NULL;
 	int ret = 0;
@@ -799,7 +851,7 @@ int mc_alloc_align(struct neuron_device *nd, enum mc_lifespan lifespan, u64 size
 
 void mc_inc_refcount(struct mem_chunk *mc)
 {
-	struct mempool_set *mpset = mc->mpset;
+	struct neuron_mempool_set *mpset = mc->mpset;
 	mutex_lock(&mpset->lock);
 	mc->ref_count++;
 	mutex_unlock(&mpset->lock);
@@ -807,7 +859,7 @@ void mc_inc_refcount(struct mem_chunk *mc)
 
 void mc_free(struct mem_chunk **mcp)
 {
-	struct mempool_set *mpset;
+	struct neuron_mempool_set *mpset;
 	struct mem_chunk *mc = *mcp;
 
 	BUG_ON(mc == NULL);
@@ -845,7 +897,7 @@ void mc_free(struct mem_chunk **mcp)
 		mpset->host_mem_size -= mc->size;
 		nsysfsmetric_dec_counter(mpset->nd, NON_NDS_METRIC, NON_NDS_COUNTER_HOST_MEM, mc->nc_id, mc->size, false);
 	} else if (mc->mem_location == MEM_LOC_DEVICE) {
-		struct mempool *mp;
+		struct neuron_mempool *mp;
 		mp = &mpset->mp_device[mc->dram_channel][mc->dram_region];
 		gen_pool_free(mc->gen_pool, (u64)mc->va, mc->size);
 		mp->allocated_size -= mc->size;
@@ -878,7 +930,7 @@ void mc_free(struct mem_chunk **mcp)
 
 int mc_dump_all_chunks(struct neuron_device *nd, u32 channel, u32 num_entries_in, struct neuron_ioctl_mem_chunk_info *data, u32 *num_entries_out)
 {
-	struct mempool_set *mpset = &nd->mpset;
+	struct neuron_mempool_set *mpset = &nd->mpset;
 	u32 cnt = 0;
 	struct rb_node *node;
 

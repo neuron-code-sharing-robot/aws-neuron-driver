@@ -57,12 +57,53 @@ static atomic_t device_count = ATOMIC_INIT(0);
 struct neuron_device *neuron_devices[MAX_NEURON_DEVICE_COUNT] = { 0 };
 int total_neuron_devices = 0;
 
+extern unsigned int nmetric_log_posts;
+
 extern void ndmar_preinit(struct neuron_device *nd);
 
 struct neuron_device *neuron_pci_get_device(u8 device_index)
 {
 	BUG_ON(device_index >= MAX_NEURON_DEVICE_COUNT);
 	return neuron_devices[device_index];
+}
+
+static atomic_t dup_rid_cnt = ATOMIC_INIT(0); // count of duplicate routing IDs encountered
+int neuron_pci_handle_dup_routing_id(void) {
+	int  ret = -ENODEV;
+	int  dup_cnt;
+	char cmd[256];
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)
+	dup_cnt = atomic_fetch_add(1, &dup_rid_cnt);
+#else
+	dup_cnt = atomic_add_return(1, &dup_rid_cnt) - 1;
+#endif
+
+	// If this is the first dup encounted, unload the driver
+	if ((dup_cnt == 0) && dup_helper_enable) {
+		pr_err("scheduling unload of %s due to duplicate routing id\n", module_name(THIS_MODULE));
+
+		int n = snprintf(cmd, sizeof(cmd), "sleep 10;/sbin/modprobe -r %s", module_name(THIS_MODULE));
+		if (n >= sizeof(cmd)) {
+			pr_err("unable to schedule driver unload cmd buffer len exceeded\n");
+			return -EINVAL;
+		}
+		char *argv[] = 		  { "/bin/sh",
+								"-c",
+								cmd,
+								NULL};
+		static char *envp[] = { "HOME=/",
+								"TERM=linux",
+								"PATH=/sbin:/usr/sbin:/bin:/usr/bin",
+								NULL};
+
+		ret = call_usermodehelper( argv[0], argv, envp, UMH_WAIT_EXEC);
+		if (ret) {
+			pr_err("unable to schedule driver unload. Error: %d\n", ret);
+		}
+	}
+
+	return ret;
 }
 
 static int neuron_pci_device_init(struct neuron_device *nd)
@@ -102,7 +143,7 @@ static int neuron_pci_device_init(struct neuron_device *nd)
 		goto fail_mch;
 
 	// Initialize the device mpset
-	memset(&nd->mpset, 0, sizeof(struct mempool_set));
+	memset(&nd->mpset, 0, sizeof(struct neuron_mempool_set));
 
 	// Initialize the host portion in mpset
 	ret = mpset_constructor(&nd->mpset, &(nd->pdev->dev), nd);
@@ -112,6 +153,8 @@ static int neuron_pci_device_init(struct neuron_device *nd)
 	// Initialize CRWL struct
 	for (i = 0; i < MAX_NC_PER_DEVICE; i++)
 		mutex_init(&nd->crwl[i].lock);
+
+	nd->supports_hbm_7200 = -1;
 
 	ret = ncdev_create_device_node(nd);
 	if (ret) {
@@ -132,7 +175,6 @@ fail_mpset:
 fail_mch:
 	if (nd->fw_io_ctx)
 		fw_io_destroy((struct fw_io_ctx *)nd->fw_io_ctx);
-
 	nd->fw_io_ctx = NULL;
 	return ret;
 }
@@ -185,12 +227,134 @@ static void neuron_pci_set_device_architecture(struct neuron_device *nd)
 	narch_init(arch, revision);
 }
 
+static bool is_valid_bar(int bar) {
+	return ((bar == ndhal->ndhal_pci.apb_bar) || (bar == ndhal->ndhal_pci.axi_bar) || (bar == ndhal->ndhal_pci.dram_bar));
+}
+
+/**
+ * neuron_pci_reserve_bar() - Mark the PCI region associated with PCI BAR as being reserved
+ *
+ * @param dev: PCI device whose resources are to be reserved
+ * @param bar: BAR to be reserved
+ * @param res_name: Name to be associated with resource.
+ * @return int: Returns 0 on success, otherwise failure
+ */
+static int neuron_pci_reserve_bar(struct pci_dev *dev, int bar, const char *res_name) {
+	int ret;
+
+	if (!is_valid_bar(bar)) {
+		pci_info(dev, "invalid BAR%d\n", bar);
+		goto err;
+	}
+	if (bar == BAR_UNUSED) {
+		return 0;
+	}
+
+	ret = pci_request_region(dev, bar, res_name);
+	if (ret) {
+		pci_info(dev, "BAR %d: can't reserve %s\n", bar, res_name);
+		goto err;
+	}
+
+	return 0;
+
+err:
+	// allow failure to map on dram bar, as some setups may not support it
+	if (bar == ndhal->ndhal_pci.dram_bar) {
+		return 0;
+	} else {
+		return -ENODEV;
+	}
+}
+
+ /**
+ * neuron_pci_set_npdev() - set BAR's physical addr, io addr, and size of neuron_pci_device
+ *
+ * @param dev: PCI device that owns the BAR
+ * @param bar: BAR number
+ * @param res_name: Name associated with resource
+ * @param bar_pa: start physical address of BAR
+ * @param bar_ioaddr: __iomem address to device BAR
+ * @param bar_size: size of BAR
+ * @return int: Returns 0 on success, otherwise failure
+ */
+static int neuron_pci_set_npdev(struct pci_dev *dev,
+                            int bar,
+                            const char *res_name,
+                            phys_addr_t *bar_pa,
+                            void __iomem **bar_ioaddr,
+                            u64 *bar_size) {
+	if (!is_valid_bar(bar)) {
+		pci_info(dev, "invalid BAR%d\n", bar);
+		return -ENODEV;
+	}
+	if (bar == BAR_UNUSED) {
+		return 0;
+	}
+
+	if (pci_resource_len(dev, bar) == 0) {
+		pci_info(dev, "BAR%d len is 0\n", bar);
+		goto err;
+	}
+
+	*bar_pa = pci_resource_start(dev, bar);
+	if (!(*bar_pa)) {
+		pci_info(dev, "Can't get start address of BAR%d %s\n", bar, res_name);
+		goto err;
+	}
+	*bar_size = pci_resource_len(dev, bar);
+
+	if (bar == ndhal->ndhal_pci.dram_bar) {
+		ndhal->ndhal_pci.dram_bar_size = *bar_size;
+	}
+
+	if (bar == ndhal->ndhal_pci.dram_bar && wc_enable) {
+		*bar_ioaddr = pci_iomap_wc(dev, bar, pci_resource_len(dev, bar));
+	}
+	else {
+		*bar_ioaddr = pci_iomap(dev, bar, pci_resource_len(dev, bar));
+	}
+
+	return 0;
+
+err:
+	// allow failure to map on dram bar, as some setups may not support it
+	if (bar == ndhal->ndhal_pci.dram_bar) {
+		*bar_pa = 0;
+		*bar_size = 0;
+		*bar_ioaddr = NULL;
+		return 0;
+	} else {
+		return -ENODEV;
+	}
+}
+
+/**
+ * neuron_pci_release_bar() - Release a PCI BAR
+ *
+ * @param dev: PCI device whose resources were previously reserved by pci_request_region()
+ * @param bar: BAR to be reserved
+ *
+ */
+static int neuron_pci_release_bar(struct pci_dev *dev, int bar) {
+	if (!is_valid_bar(bar)) {
+		pci_info(dev, "invalid BAR%d\n", bar);
+		return -ENODEV;
+	}
+	if (bar == BAR_UNUSED) {
+		return 0;
+	}
+
+	pci_release_region(dev, bar);
+	return 0;
+}
+
 static int neuron_pci_probe(struct pci_dev *dev, const struct pci_device_id *id)
 {
 	int ret = 0;
 	struct neuron_device *nd;
 
-	nd = kzalloc(sizeof(struct neuron_device), GFP_KERNEL);
+	nd = kvzalloc(sizeof(struct neuron_device), GFP_KERNEL);
 	if (nd == NULL) {
 		pci_info(dev, "Can't allocate memory for neuron_device\n");
 		goto fail_alloc_nd_mem;
@@ -223,31 +387,31 @@ static int neuron_pci_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	}
 
 	// map apb bar
-	ret = ndhal->ndhal_pci.neuron_pci_reserve_bar(dev, ndhal->ndhal_pci.apb_bar, "APB");
+	ret = neuron_pci_reserve_bar(dev, ndhal->ndhal_pci.apb_bar, "APB");
 	if (ret) {
 		goto fail_bar0_map;
 	}
-	ret = ndhal->ndhal_pci.neuron_pci_set_npdev(dev, ndhal->ndhal_pci.apb_bar, "APB", &nd->npdev.bar0_pa, &nd->npdev.bar0, &nd->npdev.bar0_size);
+	ret = neuron_pci_set_npdev(dev, ndhal->ndhal_pci.apb_bar, "APB", &nd->npdev.bar0_pa, &nd->npdev.bar0, &nd->npdev.bar0_size);
 	if (ret) {
 		goto fail_bar0_resource;
 	}
 
 	// map bar2
-	ret = ndhal->ndhal_pci.neuron_pci_reserve_bar(dev,  ndhal->ndhal_pci.axi_bar, "AXI");
+	ret = neuron_pci_reserve_bar(dev,  ndhal->ndhal_pci.axi_bar, "AXI");
 	if (ret) {
 		goto fail_bar2_map;
 	}
-	ret = ndhal->ndhal_pci.neuron_pci_set_npdev(dev, ndhal->ndhal_pci.axi_bar, "AXI", &nd->npdev.bar2_pa, &nd->npdev.bar2, &nd->npdev.bar2_size);
+	ret = neuron_pci_set_npdev(dev, ndhal->ndhal_pci.axi_bar, "AXI", &nd->npdev.bar2_pa, &nd->npdev.bar2, &nd->npdev.bar2_size);
 	if (ret) {
 		goto fail_bar2_resource;
 	}
 
 	// map bar4
-	ret = ndhal->ndhal_pci.neuron_pci_reserve_bar(dev, ndhal->ndhal_pci.dram_bar, "BAR4");
+	ret = neuron_pci_reserve_bar(dev, ndhal->ndhal_pci.dram_bar, "BAR4");
 	if (ret) {
 		goto fail_bar4_map;
 	}
-	ret = ndhal->ndhal_pci.neuron_pci_set_npdev(dev, ndhal->ndhal_pci.dram_bar, "BAR4", &nd->npdev.bar4_pa, &nd->npdev.bar4, &nd->npdev.bar4_size);
+	ret = neuron_pci_set_npdev(dev, ndhal->ndhal_pci.dram_bar, "BAR4", &nd->npdev.bar4_pa, &nd->npdev.bar4, &nd->npdev.bar4_size);
 	if (ret) {
 		goto fail_bar4_resource;
 	}
@@ -290,10 +454,12 @@ static int neuron_pci_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	if (ret)
 		goto fail_memset_mc;
 
-	// initialize metric aggregation and posting
- 	ret = nmetric_init(nd);
- 	if (ret)
- 		goto fail_nmetric_resource;
+	if (nmetric_log_posts != 0) {
+		// initialize metric aggregation and posting
+		ret = nmetric_init(nd);
+		if (ret)
+			goto fail_nmetric_resource;
+	 }
 
 	mutex_init(&nd->memset_lock);
 
@@ -310,19 +476,19 @@ fail_memset_mc:
 fail_nds_resource:
 	neuron_ds_destroy(&nd->datastore);
 fail_bar4_resource:
-	ndhal->ndhal_pci.neuron_pci_release_bar(dev, ndhal->ndhal_pci.dram_bar);
+	neuron_pci_release_bar(dev, ndhal->ndhal_pci.dram_bar);
 fail_bar4_map:
 fail_bar2_resource:
-	ndhal->ndhal_pci.neuron_pci_release_bar(dev, ndhal->ndhal_pci.axi_bar);
+	neuron_pci_release_bar(dev, ndhal->ndhal_pci.axi_bar);
 fail_bar2_map:
 fail_bar0_resource:
-	ndhal->ndhal_pci.neuron_pci_release_bar(dev, ndhal->ndhal_pci.apb_bar);
+	neuron_pci_release_bar(dev, ndhal->ndhal_pci.apb_bar);
 fail_bar0_map:
 	pci_disable_device(dev);
 fail_dhal_init:
 fail_enable:
 	neuron_log_destroy( nd);
-	kfree(nd);
+	kvfree(nd);
 fail_alloc_nd_mem:
 	pci_set_drvdata(dev, NULL);
 	return ret;
@@ -342,11 +508,11 @@ static void neuron_pci_remove(struct pci_dev *dev)
 
     ndhal->ndhal_ext_cleanup();
 
-	ndhal->ndhal_pci.neuron_pci_release_bar(dev, ndhal->ndhal_pci.apb_bar);
+	neuron_pci_release_bar(dev, ndhal->ndhal_pci.apb_bar);
 
-	ndhal->ndhal_pci.neuron_pci_release_bar(dev, ndhal->ndhal_pci.axi_bar);
+	neuron_pci_release_bar(dev, ndhal->ndhal_pci.axi_bar);
 
-	ndhal->ndhal_pci.neuron_pci_release_bar(dev, ndhal->ndhal_pci.dram_bar);
+	neuron_pci_release_bar(dev, ndhal->ndhal_pci.dram_bar);
 
 	pci_disable_device(dev);
 
@@ -364,7 +530,7 @@ static void neuron_pci_remove(struct pci_dev *dev)
 
 	neuron_log_destroy(nd);
 
-	kfree(nd);
+	kvfree(nd);
 }
 
 static struct pci_driver neuron_pci_driver = {

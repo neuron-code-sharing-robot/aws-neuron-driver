@@ -85,7 +85,7 @@ struct neuron_device {
 
 	void *fw_io_ctx;
 
-	struct mempool_set mpset;
+	struct neuron_mempool_set mpset;
 
 	// memory chunk allocated for notification queue in each neuron core.
 	struct mem_chunk *nq_mc[MAX_NC_PER_DEVICE][MAX_NQ_SUPPORTED];
@@ -118,6 +118,14 @@ struct neuron_device {
 	struct neuron_log_obj log_obj; // logging object
 
 	struct neuron_hbm_scrub_ctx hbm_scrub_ctx;
+
+	// volatile to prevent compiler optimizations since accessed by different threads
+	// Indicates whether any performance profile with 7200 Mhz HBM is supported by this device
+	volatile int supports_hbm_7200;
+
+	// volatile to prevent compiler optimizations since accessed by different threads
+	// This is the true value per-device, instead of the global one in ndhal_perf used only for metrics
+	volatile int current_perf_profile;
 };
 
 #endif

@@ -17,7 +17,6 @@
 #define V2_PCIE_ALL_RT_MASK                    0x01f00000000000ull
 
 // relative to nc
-#define V2_MMAP_P_OFFSET 0x00000000000000ull
 #define V2_MMAP_NC_EVENT_OFFSET 0x00000002700000ull
 #define V2_MMAP_NC_SEMA_READ_OFFSET V2_MMAP_NC_EVENT_OFFSET + 0x00000000001000ull
 #define V2_MMAP_NC_SEMA_SET_OFFSET V2_MMAP_NC_EVENT_OFFSET + 0x00000000001400ull
@@ -34,8 +33,6 @@
 
 // relative to V2 address space
 #define V2_APB_MISC_RAM_OFFSET 0x000ffff0fa0000ull
-
-#define V2_MMAP_NC_SIZE 0x00000004000000ull
 
 // Number of dice per chip
 #define V2_NUM_DIE_PER_DEVICE 1

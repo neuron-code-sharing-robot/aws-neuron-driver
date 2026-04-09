@@ -64,7 +64,7 @@ static int udma_m2s_packet_size_cfg_set(struct udma *udma, struct udma_m2s_pkt_l
 #define UDMA_AXI_M2S_DATA_RD_CFG_ALWAYS_BREAK_ON_MAX_BOUDRY (1 << 16)
 
 /* set default configuration of one DMA engine */
-static int udma_set_defaults(struct udma *udma)
+int udma_set_defaults(struct udma *udma)
 {
 	int ret = 0;
 	struct udma_gen_ex_regs __iomem *gen_ex_regs;
@@ -116,7 +116,7 @@ static int udma_set_defaults(struct udma *udma)
 
 	/* Set addr_hi selectors */
 	gen_ex_regs = (struct udma_gen_ex_regs __iomem *)udma->gen_ex_regs;
-	for (i = 0; i < DMA_MAX_Q_V4; i++)
+	for (i = 0; i < ndhal->ndhal_udma.num_queues; i++)
 		reg_write32(&gen_ex_regs->vmpr_v4[i].tx_sel, 0xffffffff);
 
 	/* Set M2S data read master configuration */
@@ -128,7 +128,7 @@ static int udma_set_defaults(struct udma *udma)
 
 	/* Set addr_hi selectors */
 	gen_ex_regs = (struct udma_gen_ex_regs __iomem *)udma->gen_ex_regs;
-	for (i = 0; i < DMA_MAX_Q_V4; i++) {
+	for (i = 0; i < ndhal->ndhal_udma.num_queues; i++) {
 		reg_write32(&gen_ex_regs->vmpr_v4[i].rx_sel[0], 0xffffffff);
 		reg_write32(&gen_ex_regs->vmpr_v4[i].rx_sel[1], 0xffffffff);
 		reg_write32(&gen_ex_regs->vmpr_v4[i].rx_sel[2], 0xffffffff);
@@ -181,10 +181,10 @@ static int udma_set_defaults(struct udma *udma)
  * So instead of reading CSR use hardware reset value(from datasheet) as
  * default value.
  */
-static int udma_cache_defaults(struct udma *udma)
+int udma_cache_defaults(struct udma *udma)
 {
 	int i;
-	for (i = 0; i < DMA_MAX_Q_V4; i++) {
+	for (i = 0; i < ndhal->ndhal_udma.num_queues; i++) {
 		struct udma_q *q = &udma->udma_q_m2s[i];
 		q->cfg = M2S_CFG_RESET_VALUE;
 		q->rlimit_mask = M2S_RATE_LIMIT_RESET_VALUE;
@@ -259,7 +259,7 @@ static int udma_q_set_pointers(struct udma_q *udma_q)
 
 /** enable/disable udma queue
  */
-static void udma_q_enable(struct udma_q *udma_q, int enable)
+void udma_q_enable(struct udma_q *udma_q, int enable)
 {
 	u32 reg;
 

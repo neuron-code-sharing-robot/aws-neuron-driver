@@ -2,6 +2,7 @@
 
 #include "neuron_arch.h"
 #include "neuron_dhal.h"
+#include "neuron_cdev.h"
 
 struct neuron_dhal *ndhal = NULL;
 
@@ -24,10 +25,9 @@ int neuron_dhal_init(unsigned int pci_device_id) {
             return -ENOMEM;
         }
     } else {
-        mutex_unlock(&ndhal_init_lock);
-        return 0;
+		mutex_unlock(&ndhal_init_lock);
+		return 0;
     }
-    mutex_unlock(&ndhal_init_lock);
 
     ndhal->ndhal_arch.arch = narch_get_arch();
     ndhal->pci_device_id = pci_device_id;
@@ -46,8 +46,14 @@ int neuron_dhal_init(unsigned int pci_device_id) {
             break;
         default:
             pr_err("Unknown HW architecture: %d. Can't init neuron_dhal.\n", ndhal->ndhal_arch.arch);
+    		mutex_unlock(&ndhal_init_lock);
             return -EINVAL;
     }
+
+	// global class attributes get delayed initialization - need platform data from dhal
+	ncdev_class_attr_init();
+
+	mutex_unlock(&ndhal_init_lock);
 
     return ret;
 }
@@ -55,6 +61,8 @@ int neuron_dhal_init(unsigned int pci_device_id) {
 void neuron_dhal_cleanup(void)
 {
     if (ndhal) {
+		ncdev_class_attr_cleanup();
+
     	if (ndhal->ndhal_ext_cleanup) {
     		ndhal->ndhal_ext_cleanup();
 		}

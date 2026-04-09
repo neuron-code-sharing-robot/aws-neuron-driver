@@ -10,6 +10,48 @@
 #include <linux/types.h>
 #include "neuron_device.h"
 
+#define NOTIFIC_NQ_SIZE 0x28   // total size of the NQ register space
+#define NOTIFIC_NQ_BASE_ADDR_LO_OFFSET_START 0x100
+#define NOTIFIC_NQ_BASE_ADDR_LO_OFFSET(index) (NOTIFIC_NQ_BASE_ADDR_LO_OFFSET_START + ((index)*NOTIFIC_NQ_SIZE) + 0)
+
+#define NOTIFIC_NQ_BASE_ADDR_LO_RESET_VALUE 0x00000000
+
+static inline void notific_write_nq_base_addr_lo(void __iomem *base, size_t index,
+								  uint32_t value)
+{
+	const size_t offset = NOTIFIC_NQ_BASE_ADDR_LO_OFFSET(index);
+
+	reg_write32(base + offset, value);
+}
+
+#define NOTIFIC_NQ_BASE_ADDR_HI_OFFSET_START 0x104
+#define NOTIFIC_NQ_BASE_ADDR_HI_OFFSET(index) (NOTIFIC_NQ_BASE_ADDR_HI_OFFSET_START + ((index)*NOTIFIC_NQ_SIZE) + 0)
+
+#define NOTIFIC_NQ_BASE_ADDR_HI_RESET_VALUE 0x00000000
+
+static inline void notific_write_nq_base_addr_hi(void __iomem *base, size_t index,
+								  uint32_t value)
+{
+	const size_t offset = NOTIFIC_NQ_BASE_ADDR_HI_OFFSET(index);
+
+	reg_write32(base + offset, value);
+}
+
+#define NOTIFIC_NQ_F_SIZE_OFFSET_START 0x108
+#define NOTIFIC_NQ_F_SIZE_OFFSET(index) (NOTIFIC_NQ_F_SIZE_OFFSET_START + ((index)*NOTIFIC_NQ_SIZE) + 0)
+
+#define NOTIFIC_F_SIZE_RESET_VALUE 0x00000000
+
+static inline void notific_write_nq_f_size(void __iomem *base, size_t index,
+							    uint32_t value)
+{
+	const size_t offset = NOTIFIC_NQ_F_SIZE_OFFSET(index);
+
+	reg_write32(base + offset, value);
+}
+
+#define NOTIFIC_NQ_HEAD_OFFSET 0x10c
+
 /**
  * nnq_init() - Initialize notification queue for NeuronCore
  *

@@ -41,6 +41,19 @@ int ncdev_create_device_node(struct neuron_device *ndev);
 int ncdev_delete_device_node(struct neuron_device *ndev);
 
 /**
+ * ncdev_class_attr_init() - initialize global class attributes
+ *
+ * @return int: return 0 on success, otherwise failure
+ */
+int ncdev_class_attr_init(void);
+
+/**
+ * ncdev_class_attr_cleanup() - cleanup glboal class attributes
+ *
+ */
+void ncdev_class_attr_cleanup(void);
+
+/**
  * ncdev_module_init() - Initialize the kernel module that creates the character devices
  * 
  * @return int: return 0 on success, otherwise failure

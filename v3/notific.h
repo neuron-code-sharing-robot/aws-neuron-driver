@@ -19,6 +19,7 @@
  */
 
 #include "address_map.h"
+#include "../neuron_nq.h"
 #include "../neuron_reg_access.h"
 
 /** Returns NOTIFIC relative offset for given the DMA engine for given NC.
@@ -62,48 +63,3 @@ static inline u64 notific_get_relative_offset_topsp_v3(int ts_idx)
 
 int notific_decode_nq_head_reg_access_v3(u64 offset, u8 *nc_id, u32 *nq_type, u8 *instance,
 				      bool *is_top_sp);
-
-
-/*
- * COMMON with V2 need to move to shared include at some point
- *
- */
-#define NOTIFIC_NQ_SIZE 0x28   // total size of the NQ register space
-#define NOTIFIC_NQ_BASE_ADDR_LO_OFFSET_START 0x100
-#define NOTIFIC_NQ_BASE_ADDR_LO_OFFSET(index) (NOTIFIC_NQ_BASE_ADDR_LO_OFFSET_START + ((index)*NOTIFIC_NQ_SIZE) + 0)
-
-#define NOTIFIC_NQ_BASE_ADDR_LO_RESET_VALUE 0x00000000
-
-static inline void notific_write_nq_base_addr_lo(void __iomem *base, size_t index,
-								  uint32_t value)
-{
-	const size_t offset = NOTIFIC_NQ_BASE_ADDR_LO_OFFSET(index);
-
-	reg_write32(base + offset, value);
-}
-
-#define NOTIFIC_NQ_BASE_ADDR_HI_OFFSET_START 0x104
-#define NOTIFIC_NQ_BASE_ADDR_HI_OFFSET(index) (NOTIFIC_NQ_BASE_ADDR_HI_OFFSET_START + ((index)*NOTIFIC_NQ_SIZE) + 0)
-
-#define NOTIFIC_NQ_BASE_ADDR_HI_RESET_VALUE 0x00000000
-
-static inline void notific_write_nq_base_addr_hi(void __iomem *base, size_t index,
-								  uint32_t value)
-{
-	const size_t offset = NOTIFIC_NQ_BASE_ADDR_HI_OFFSET(index);
-
-	reg_write32(base + offset, value);
-}
-
-#define NOTIFIC_NQ_F_SIZE_OFFSET_START 0x108
-#define NOTIFIC_NQ_F_SIZE_OFFSET(index) (NOTIFIC_NQ_F_SIZE_OFFSET_START + ((index)*NOTIFIC_NQ_SIZE) + 0)
-
-#define NOTIFIC_F_SIZE_RESET_VALUE 0x00000000
-
-static inline void notific_write_nq_f_size(void __iomem *base, size_t index,
-							    uint32_t value)
-{
-	const size_t offset = NOTIFIC_NQ_F_SIZE_OFFSET(index);
-
-	reg_write32(base + offset, value);
-}

@@ -18,13 +18,13 @@
 #include "neuron_cdev.h"
 #include "neuron_pci.h"
 
-MODULE_DESCRIPTION("Neuron Driver, built from SHA: 6670442319042643165ab7986e5184496ea4407c");
+MODULE_DESCRIPTION("Neuron Driver, built from SHA: 1c7ed9bd14936635773b5a01777882804ee8ea6e");
 MODULE_LICENSE("GPL");
-MODULE_VERSION("2.26.5.0");
+MODULE_VERSION("2.27.4.0");
 MODULE_ALIAS("pci:v00001d0fd00007064sv*sd*bc*sc*i*");
 
-const char driver_version[] = "2.26.5.0";
-const char driver_revision[] = "6670442319042643165ab7986e5184496ea4407c";
+const char driver_version[] = "2.27.4.0";
+const char driver_revision[] = "1c7ed9bd14936635773b5a01777882804ee8ea6e";
 
 #ifdef CONFIG_FAULT_INJECTION
 

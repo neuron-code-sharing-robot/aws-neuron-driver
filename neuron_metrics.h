@@ -29,6 +29,7 @@
 #define NMETRIC_TYPE_DRIVER_RESET 0x6
 #define NMETRIC_TYPE_DRIVER_USERVER 0x7
 #define NMETRIC_TYPE_UTILIZATION  0x8
+#define NMETRIC_TYPE_ECC_ERR_COUNTER 0x9
 
 #define NMETRIC_FLAG_VERS_ALLOW_TYPE	(1)
 
@@ -81,7 +82,10 @@ struct nmetric_driver_metrics {
 #define NMETRIC_BITMAP_COUNT 1
 
 // Number of metrics of type NMETRIC_CONSTANT_U64
-#define NMETRIC_CONSTANT_U64_COUNT 1
+#define NMETRIC_CONSTANT_U64_COUNT 2
+
+// Number of metrics of type NMETRIC_TYPE_ECC_ERR_COUNTER
+#define NMETRIC_ECC_ERR_COUNT 3
 
 typedef struct {
 	u8 index;	// metric specific index
@@ -104,6 +108,7 @@ typedef struct {
 #define NMETRIC_CONSTANT_U64(idx, tick, cw_id, ds_id, flags) NMETRIC_DEF(idx, NMETRIC_TYPE_CONSTANT_U64, 1, tick, cw_id, ds_id, flags)
 #define NMETRIC_DRIVER_DEF(idx, tick, cw_id)                 NMETRIC_DEF(idx, NMETRIC_TYPE_DRIVER_RESET, 1, tick, cw_id, 0xFF, 0)
 #define NMETRIC_DRIVER_USERVER_DEF(idx, tick, cw_id)         NMETRIC_DEF(idx, NMETRIC_TYPE_DRIVER_USERVER, 1, tick, cw_id, 0xFF, 0)
+#define NMETRIC_DRIVER_ECC_ERR_DEF(idx, tick, cw_id)         NMETRIC_DEF(idx, NMETRIC_TYPE_ECC_ERR_COUNTER, 1, tick, cw_id, 0xFF, 0)
 
 struct nmetric_versions {
 	u32 version_usage_count[NEURON_METRICS_VERSION_MAX_CAPACITY];
@@ -126,6 +131,7 @@ struct nmetric_aggregation_thread {
 	u64 curr[NMETRIC_COUNTER_COUNT]; // metrics for the current session so far
 	u64 prev[NMETRIC_COUNTER_COUNT]; // recorded metrics from the last post
 	u64 freed[NMETRIC_COUNTER_COUNT]; // cache holding metrics that were freed before the posting period was reached
+	u64 ecc_prev[NMETRIC_ECC_ERR_COUNT]; // ECC error counts up to the current post
 };
 
 struct neuron_metrics {

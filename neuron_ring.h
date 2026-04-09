@@ -7,6 +7,7 @@
 #define NEURON_RING_H
 
 #include "udma/udma.h"
+#include "share/neuron_driver_shared.h"
 
 #define DMA_H2T_DESC_COUNT 4096
 #define NUM_DMA_ENG_PER_DEVICE 132 // for v2 2 nc with each 16,
@@ -19,6 +20,115 @@ extern int nc_per_dev_param;
 struct neuron_device;
 struct neuron_dma_eng_state;
 struct neuron_dma_queue_state;
+struct ndma_eng;
+struct ndma_ring;
+
+/*
+ * H2D DMA Completion Queue (CQ)
+ * -----------------------------
+ * A fixed-size circular buffer shared between driver and runtime, consisting of
+ * NDMA_H2D_COMPL_QUEUE_CAPACITY Completion Queue Entries (CQEs).
+ *
+ * Driver Lib mmaps both the CQ and its metadata (head/tail and capacity) to 
+ * runtime. The driver writes a completion result at tail CQE, while the runtime 
+ * consumes from head CQE and clears it. Each CQE contains a sequence number,
+ * a completion result, and an opaque context pointer.
+ *
+ * Correctness: CQ is SPMC (one driver kthread writes per ND; multiple runtime
+ * threads read). Runtime must lock; driver is lock-free. Both sides require
+ * smp_wmb()/smp_rmb() barriers.
+ *
+ * Async IO only.
+ *
+ * Also see neuron_h2d_dma_compl_queue_t and
+ * neuron_h2d_dma_compl_queue_entry_t in neuron_driver_shared.h.
+ *
+ */
+struct ndma_h2d_compl_queue {
+	uint32_t capacity_mask;	// Capacity mask of the CQ (capacity - 1).
+	uint32_t tail;			// Free-running index of the next free CQE to be written by driver. 
+							// Internally maintained by driver.
+	struct mem_chunk *mc;	// Memchunk for the CQ.
+	neuron_h2d_dma_compl_queue_t *compl_queue_shared;// the CQ structure mmapped to and shared with user space.
+};
+
+int ndma_h2d_compl_queue_init(struct neuron_device *nd, struct ndma_h2d_compl_queue *compl_queue);
+void ndma_h2d_compl_queue_destroy(struct ndma_h2d_compl_queue *compl_queue);
+
+/*
+ * H2D DMA Context Queue
+ * ---------------------
+ * A fixed-size circular buffer storing pointers to `ndma_h2t_zcdma_context`.
+ * The queue tracks DMA context lifecycles (submitted, pinned, or unpinned)
+ * and maintains four logical indices:
+ *
+ *   1. head
+ *        - Index of the first *valid* (non-empty) entry in the queue.
+ *        - The context at `head` may be in any ndma_zcdma_state except
+ *          NDMA_COMPLETED.
+ *
+ *   2. tail
+ *        - Index of the next free slot where a new context pointer will be
+ *          inserted.
+ *
+ *   3. first_pinned_unsubmitted
+ *        - Index of the earliest context that is pinned but not yet submitted.
+ *        - If no such context exists, this is set to first_unpinned.
+ *
+ *   4. first_unpinned
+ *        - Index of the earliest context that is unpinned.
+ *        - If no such context exists, this is set to tail.
+ *
+ * Queue state conditions:
+ *   - Empty: head == tail
+ *   - Full:  head == ((tail + 1) & (capacity - 1))
+ *   - Current size: (tail - head + capacity) & (capacity - 1)
+ *
+ * Example (capacity = 10):
+ *
+ *   index:  0    1    2    3    4    5    6    7    8    9
+ *   entry: [ ]  [S]  [S]  [S]  [P]  [P]  [U]  [U]  [ ]  [ ]
+ *                ^              ^         ^         ^
+ *                |              |         |         |
+ *                H             FPU       FU         T
+ *
+ *   Legend:
+ *     H  = head
+ *     T  = tail
+ *     FPU = first_pinned_unsubmitted
+ *     FU  = first_unpinned
+ *
+ *     [C] = completed
+ *     [S] = submitted
+ *     [P] = pinned but unsubmitted
+ *     [U] = unpinned
+ *     [ ] = empty slot
+ *
+ * @entries: Array of DMA context entries in the queue
+ * @completion_pool: Pre-allocated pool of completion_ptr buffer
+ * @page_list_pool: Pre-allocated pool of page_list arrays
+ * @capacity_mask: Maximum number of entries the queue can hold and minus one,
+ *                 capacity = capacity_mask + 1
+ * @head: Index pointing to the head of the queue
+ * @tail: Index pointing to the tail of the queue
+ * @first_pinned_unsubmitted: Index of the first pinned but not yet submitted entry
+ * @first_unpinned: Index of the first unpinned entry in the queue
+ * @nr_pinned_pages: Total count of pinned memory pages belonged to the queue
+ */
+struct ndma_ctx_queue {
+	struct ndma_h2t_zcdma_context *entries;
+	void *completion_pool;
+	void *page_list_pool;
+	u32 capacity_mask;
+	u32 head;
+	u32 tail;
+	u32 first_pinned_unsubmitted;
+	u32 first_unpinned;
+	u64 nr_pinned_pages;
+};
+
+int ndma_ctx_queue_init(struct ndma_ctx_queue *queue);
+void ndma_ctx_queue_free(struct ndma_eng *eng, struct ndma_ring *ring, struct ndma_ctx_queue *queue);
 
 /*
  * dma context for both sync and async DMA operations
@@ -49,6 +159,8 @@ struct ndma_ring {
 	struct udma_ring_ptr h2t_completion;  // TODO why are we using udma_ring_ptr...
 	struct mem_chunk *h2t_completion_mc;
 	struct ndma_h2t_dma_context h2t_dma_ctx[NEURON_DMA_H2T_CTX_HANDLE_CNT];
+	struct ndma_ctx_queue dma_ctx_queue;
+	struct ndma_h2d_compl_queue dma_compl_queue;
 	u32 h2t_nc_id;
 	bool h2t_allocated; // ring can be allocated for standard use or h2t 
 	u32 qid;

@@ -49,24 +49,36 @@ DECLARE_FAULT_ATTR(neuron_fail_nc_mmap);
 
 int nc_semaphore_read(struct neuron_device *nd, u8 nc_id, u16 semaphore_index, u32 *result)
 {
+	int ret = 0;
 	void *addr;
 
 	if (semaphore_index >= ndhal->ndhal_address_map.semaphore_count)
 		return -EINVAL;
 
-	addr = ndhal->ndhal_nc.nc_get_semaphore_base(nd, nc_id);
+	ret = ndhal->ndhal_nc.nc_get_semaphore_base(nd, nc_id, &addr);
+	if (ret) {
+		pr_err("failed to retrieve semaphore base");
+		return ret;
+	}
+
 	addr += ndhal->ndhal_address_map.mmap_nc_sema_read_offset + (semaphore_index * NC_SEMAPHORE_SIZE);
-	return ndhal->ndhal_reg_access.reg_read32_array((void **)&addr, result, 1);
+	return ndhal->ndhal_fw_io.fw_io_read_csr_array((void **)&addr, result, 1, true);
 }
 
 int nc_semaphore_write(struct neuron_device *nd, u8 nc_id, u16 semaphore_index, u32 value)
 {
+	int ret = 0;
 	void *addr;
 
 	if (semaphore_index >= ndhal->ndhal_address_map.semaphore_count)
 		return -EINVAL;
 
-	addr = ndhal->ndhal_nc.nc_get_semaphore_base(nd, nc_id);
+	ret = ndhal->ndhal_nc.nc_get_semaphore_base(nd, nc_id, &addr);
+	if (ret) {
+		pr_err("failed to retrieve semaphore base");
+		return ret;
+	}
+
 	addr += ndhal->ndhal_address_map.mmap_nc_sema_set_offset + (semaphore_index * NC_SEMAPHORE_SIZE);
 	writel(value, addr);
 	return 0;
@@ -74,12 +86,18 @@ int nc_semaphore_write(struct neuron_device *nd, u8 nc_id, u16 semaphore_index, 
 
 int nc_semaphore_increment(struct neuron_device *nd, u8 nc_id, u16 semaphore_index, u32 value)
 {
+	int ret = 0;
 	void *addr;
 
 	if (semaphore_index >= ndhal->ndhal_address_map.semaphore_count)
 		return -EINVAL;
 
-	addr = ndhal->ndhal_nc.nc_get_semaphore_base(nd, nc_id);
+	ret = ndhal->ndhal_nc.nc_get_semaphore_base(nd, nc_id, &addr);
+	if (ret) {
+		pr_err("failed to retrieve semaphore base");
+		return ret;
+	}
+
 	addr += ndhal->ndhal_address_map.mmap_nc_sema_incr_offset + (semaphore_index * NC_SEMAPHORE_SIZE);
 	writel(value, addr);
 	return 0;
@@ -87,12 +105,18 @@ int nc_semaphore_increment(struct neuron_device *nd, u8 nc_id, u16 semaphore_ind
 
 int nc_semaphore_decrement(struct neuron_device *nd, u8 nc_id, u16 semaphore_index, u32 value)
 {
+	int ret = 0;
 	void *addr;
 
 	if (semaphore_index >= ndhal->ndhal_address_map.semaphore_count)
 		return -EINVAL;
 
-	addr = ndhal->ndhal_nc.nc_get_semaphore_base(nd, nc_id);
+	ret = ndhal->ndhal_nc.nc_get_semaphore_base(nd, nc_id, &addr);
+	if (ret) {
+		pr_err("failed to retrieve semaphore base");
+		return ret;
+	}
+
 	addr += ndhal->ndhal_address_map.mmap_nc_sema_decr_offset + (semaphore_index * NC_SEMAPHORE_SIZE);
 	writel(value, addr);
 	return 0;
@@ -100,23 +124,35 @@ int nc_semaphore_decrement(struct neuron_device *nd, u8 nc_id, u16 semaphore_ind
 
 int nc_event_get(struct neuron_device *nd, u8 nc_id, u16 event_index, u32 *result)
 {
+	int ret = 0;
 	void *addr;
 
 	if (event_index > ndhal->ndhal_address_map.event_count)
 		return -EINVAL;
 
-	addr = ndhal->ndhal_nc.nc_get_event_addr(nd, nc_id, event_index);
-	return ndhal->ndhal_reg_access.reg_read32_array(&addr, result, 1);
+	ret = ndhal->ndhal_nc.nc_get_event_addr(nd, nc_id, event_index, &addr);
+	if (ret) {
+		pr_err("failed to retrieve event %u addr", event_index);
+		return ret;
+	}
+
+	return ndhal->ndhal_fw_io.fw_io_read_csr_array(&addr, result, 1, true);
 }
 
 int nc_event_set(struct neuron_device *nd, u8 nc_id, u16 event_index, u32 value)
 {
-	u32 *addr;
+	int ret = 0;
+	void *addr;
 
 	if (event_index > ndhal->ndhal_address_map.event_count)
 		return -EINVAL;
 
-	addr = ndhal->ndhal_nc.nc_get_event_addr(nd, nc_id, event_index);
+	ret = ndhal->ndhal_nc.nc_get_event_addr(nd, nc_id, event_index, &addr);
+	if (ret) {
+		pr_err("failed to retrieve event %u addr", event_index);
+		return ret;
+	}
+
 	writel(value, addr);
 	return 0;
 }
