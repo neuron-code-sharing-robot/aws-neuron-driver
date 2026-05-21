@@ -199,6 +199,7 @@ static int neuron_pci_device_close(struct neuron_device *nd)
 		fw_io_destroy((struct fw_io_ctx *)nd->fw_io_ctx);
 
 	nd->fw_io_ctx = NULL;
+	mutex_destroy(&nd->lock);
 	return 0;
 }
 
@@ -359,6 +360,7 @@ static int neuron_pci_probe(struct pci_dev *dev, const struct pci_device_id *id)
 		pci_info(dev, "Can't allocate memory for neuron_device\n");
 		goto fail_alloc_nd_mem;
 	}
+	mutex_init(&nd->lock);
 
     nmetric_init_driver_metrics(nd);
 
@@ -487,6 +489,7 @@ fail_bar0_map:
 	pci_disable_device(dev);
 fail_dhal_init:
 fail_enable:
+	mutex_destroy(&nd->lock);
 	neuron_log_destroy( nd);
 	kvfree(nd);
 fail_alloc_nd_mem:
@@ -501,6 +504,8 @@ static void neuron_pci_remove(struct pci_dev *dev)
 	nd = pci_get_drvdata(dev);
 	if (nd == NULL)
 		return;
+
+	ndma_h2d_stop_cmpltn_thread(nd);
 
 	nr_stop_thread(nd);
 

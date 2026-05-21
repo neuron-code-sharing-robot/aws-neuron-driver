@@ -6,6 +6,9 @@
 #ifndef __NEURON_P2P_H__
 #define __NEURON_P2P_H__
 
+#define NEURON_P2P_HUGE_PAGE_SZ 0x200000
+#define NEURON_P2P_HUGE_PAGE_SZ_USAGE_THRESHOLD 0x10000000
+
 struct neuron_p2p_page_info {
     u64 physical_address; // PA's that map to the VA (page aligned as defined in va_info)
     u32 page_count; // page count each page is shift_page_size size

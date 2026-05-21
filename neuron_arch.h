@@ -24,6 +24,11 @@ enum neuron_platform_type {
 	NEURON_PLATFORM_TYPE_INVALID,
 };
 
+enum neuron_platform_operation_type {
+	NEURON_PLATFORM_OP_TYPE_DEVOPEN = 0,
+	NEURON_PLATFORM_OP_TYPE_EXEC = 1,
+};
+
 /**
  * narch_init() - Set neuron devices architecture and revision.
  *

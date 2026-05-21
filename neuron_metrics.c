@@ -19,6 +19,7 @@
 #include "neuron_device.h"
 #include "neuron_dhal.h"
 #include "neuron_power.h"
+#include "neuron_sysfs_metrics.h"
 
 unsigned int nmetric_metric_post_delay = 150000; // milliseconds
 unsigned int nmetric_metric_sample_delay = 50; // milliseconds.
@@ -1058,6 +1059,8 @@ static int nmetric_thread_fn(void *arg)
 	u64 last_metric_post_time;
 	u64 start_jiffies = jiffies;
 	u64 current_slow_tick;
+	u64 last_health_tick_jiffies = jiffies;
+	const u64 health_tick_interval_jiffies = msecs_to_jiffies(60 * 1000); // health_status cache refresh cadence
 	u8 tick_budget = 0; // how many ticks can be posted in a certain iteration of the loop
 
 	// initialize all aggregation buffers
@@ -1074,9 +1077,6 @@ static int nmetric_thread_fn(void *arg)
 	sample_delay_in_jiffies = msecs_to_jiffies(nmetric_metric_sample_delay);
 	post_delay_in_jiffies = msecs_to_jiffies(nmetric_metric_post_delay);
 	last_metric_post_time = jiffies;
-
-	pr_info("Starting metrics thread, sample_delay_in_jiffies is %llu, post delay in ms is %u, timer rate = %d, \n",
-		sample_delay_in_jiffies, nmetric_metric_post_delay, HZ);
 
 	// metrics are only sent once at rate specified by module param, new metric data may be saved without being immediately sent
 	while (!kthread_should_stop() && nd->metrics.neuron_aggregation.state != NMETRIC_STATE_STOPPED) {
@@ -1097,6 +1097,12 @@ static int nmetric_thread_fn(void *arg)
 
 		// There are some metrics that we sample at a relatively higher frequency.  Do that here.
 		nmetric_sample_high_freq(nd);
+
+		// Refresh health_status cached sysfs values 
+		if ((jiffies - last_health_tick_jiffies) >= health_tick_interval_jiffies) {
+			nsysfsmetric_health_status_tick(nd);
+			last_health_tick_jiffies = jiffies;
+		}
 
 		// For the slower metrics, we want to log once every post_delay_in_jiffies jiffies.
 		// We track this by keeping track of the number of intervals since this thread started

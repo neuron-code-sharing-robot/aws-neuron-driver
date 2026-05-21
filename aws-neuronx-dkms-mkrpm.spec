@@ -7,6 +7,10 @@
 %{?!_srcdir: %define _srcdir %_prefix/src}
 %{?!_datarootdir: %define _datarootdir %{_datadir}}
 
+%define _source_filedigest_algorithm 10
+%define _binary_filedigest_algorithm 10
+%define _binary_payload w7.xzdio
+
 Summary:	%{module_name} %{version} dkms package
 Name:		aws-neuronx-dkms
 Version:	%{version}
@@ -84,6 +88,9 @@ exit 0
 %files
 %defattr(-,root,root)
 %{_srcdir}
+%attr(755,root,root) %{_srcdir}/%{module_name}-%{version}/preinstall
+%attr(755,root,root) %{_srcdir}/%{module_name}-%{version}/postinstall
+%attr(755,root,root) %{_srcdir}/%{module_name}-%{version}/postremove
 %{_datarootdir}/%{module_name}/
 
 %changelog

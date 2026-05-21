@@ -219,6 +219,7 @@ int ncrwl_nc_range_mark(u32 nc_count, u32 start_nc_index, u32 end_nc_index,
 				ncrwl_range_mark_cnt++;
 			}
 			mutex_unlock(&ncrwl_range_lock);
+			pr_info("pid:%d  claiming neuron cores: %02d-%02d", task_tgid_nr(current), i, i + nc_count - 1);
 			return 0;
 		}
 		if (*max_range < range_len)
@@ -232,9 +233,13 @@ int ncrwl_nc_range_mark(u32 nc_count, u32 start_nc_index, u32 end_nc_index,
 void ncrwl_nc_range_unmark(volatile long unsigned int *free_map)
 {
 	int i;
+	int first = -1;
+	int last;
 	mutex_lock(&ncrwl_range_lock);
 	for (i = 0; i < MAX_NEURON_DEVICE_COUNT * MAX_NC_PER_DEVICE; i++) {
 		if (test_bit(i, free_map) && ncrwl_range_pids[i] == task_tgid_nr(current)) {
+			first = (first == -1) ? i : first;
+			last = i;
 			ncrwl_range_pids[i] = 0;
 			ncrwl_range_mark_cnt--;
 		}
@@ -242,6 +247,9 @@ void ncrwl_nc_range_unmark(volatile long unsigned int *free_map)
 		ndhal->ndhal_npe.npe_notify_mark(ncrwl_range_mark_cnt, false);
 	}
 	mutex_unlock(&ncrwl_range_lock);
+	if (first != -1) {
+		pr_info("pid:%d  releasing neuron core in range: %02d-%02d", task_tgid_nr(current), first, last);
+	}
 }
 
 int ncrwl_nc_range_pid_get( uint32_t nc_index, pid_t *pid)

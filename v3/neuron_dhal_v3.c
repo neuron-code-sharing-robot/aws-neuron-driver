@@ -40,6 +40,10 @@ int force_die_flip = 0;
 module_param(force_die_flip, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 MODULE_PARM_DESC(force_die_flip, "Force Neuron Core Mapping APIs to give back DIE flip mappings");
 
+bool enable_sysfs_health_status_nodes = true;
+module_param(enable_sysfs_health_status_nodes, bool, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+MODULE_PARM_DESC(enable_sysfs_health_status_nodes, "Enable sysfs device health_status nodes");
+
 // TOP SP addresses are sparse on chip adjust to accommodate the table macro
 //
 #define V3_TOP_SP_GRP1_BASE V3_TOP_SP_0_BASE
@@ -262,6 +266,23 @@ done:
 	return platform_type;
 }
 
+
+/* Device Arch Functions */
+/**
+ * narch_platform_ready() - return platform ready status
+ *   Certain platforms operations require the platform to be in particular state
+ *
+ */
+static int narch_platform_ready_v3(struct neuron_device *nd,  enum neuron_platform_operation_type platform_operation)
+{
+	if (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_STD) {
+		return 0;
+	} else {
+		return npe_platform_ready(nd, platform_operation);
+	}
+}
+
+
 /* Device Reset Functions */
 /**
  * nr_get_tpb_reset_map() - generates a the reset map of all resources associated with resetting a particular TPB
@@ -332,15 +353,19 @@ static int nr_initiate_reset_v3(struct neuron_device *nd, uint32_t nc_map)
 
 static int nr_initiate_reset_v3_qemu(struct neuron_device *nd, uint32_t nc_map)
 {
+	uint32_t reset_val = nc_map;
 	uint32_t tpb_reset_map_lo = 0, tpb_reset_map_hi = 0;
 	volatile void *addr;
 
 	if (no_reset)
 		return 0;
 
-	nr_get_tpb_reset_map(nc_map, &tpb_reset_map_lo, &tpb_reset_map_hi);
+	if (nc_map != NEURON_NC_MAP_DEVICE) {
+		nr_get_tpb_reset_map(nc_map, &tpb_reset_map_lo, &tpb_reset_map_hi);
+		reset_val = tpb_reset_map_lo;
+	}
 	addr = nd->npdev.bar0 + V3_PCIE_BAR0_APB_IO_0_OFFSET + V3_APB_IO_0_USER_SE_0_RESERVED2_RELBASE + 0x10;
-	writel(tpb_reset_map_lo, (volatile uint32_t *)addr);
+	writel(reset_val, (volatile uint32_t *)addr);
 
 	return 0;
 }
@@ -419,6 +444,7 @@ static int nr_post_reset_config_v3(struct neuron_device *nd, bool reset_successf
 	} else {
 		nd->supports_hbm_7200 = 0;
 	}
+	nd->current_perf_profile = 0;
 
 	if (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_STD) {
 		return 0;
@@ -712,6 +738,30 @@ static int ndmar_get_h2t_def_qid_v3(uint32_t nc_id)
 }
 
 /**
+ * ndmar_ctx_queue_bit_v3() - map a V3 H2D queue to a dense bitmap index
+ * @h2d_eng_id: DMA engine id in the V3 H2D/D2H engine range (128 to 131)
+ * @qid: DMA queue id within the engine
+ *
+ * Return bitmap bit index for the queue.
+ */
+static int ndmar_ctx_queue_bit_v3(uint32_t h2d_eng_id, uint32_t qid)
+{
+	return (h2d_eng_id - V3_D2H_0_IDX) * DMA_MAX_Q_V4 + qid;
+}
+
+/**
+ * ndmar_ctx_queue_from_bit_v3() - map a dense bitmap index back to a V3 H2D queue
+ * @bit: bitmap bit index
+ * @h2d_eng_id: returned DMA engine id
+ * @qid: returned DMA queue id
+ */
+static void ndmar_ctx_queue_from_bit_v3(int bit, uint32_t *h2d_eng_id, uint32_t *qid)
+{
+	*h2d_eng_id = V3_D2H_0_IDX + (bit / DMA_MAX_Q_V4);
+	*qid = bit % DMA_MAX_Q_V4;
+}
+
+/**
  * ndmar_is_h2t_def_q() - return true
  *
  * @param nd: Neuron device which contains the DMA engine
@@ -967,13 +1017,13 @@ static int mmap_get_bar4_offset_v3(u64 start_addr, u64 size, u64 *offset)
 {
 	u64 hbm_dist = narch_is_qemu() ? (ndhal->ndhal_pci.dram_bar_size / 4) : V3_HBM_SIZE;
 
-	if (start_addr >= V3_HBM_0_BASE && start_addr + size < V3_HBM_0_BASE + V3_HBM_ACTIVE_SIZE)
+	if (start_addr >= V3_HBM_0_BASE && start_addr + size <= V3_HBM_0_BASE + V3_HBM_ACTIVE_SIZE)
 		*offset = start_addr;
-	else if (start_addr >= V3_HBM_1_BASE && start_addr + size < V3_HBM_1_BASE + V3_HBM_ACTIVE_SIZE)
+	else if (start_addr >= V3_HBM_1_BASE && start_addr + size <= V3_HBM_1_BASE + V3_HBM_ACTIVE_SIZE)
 		*offset = start_addr - V3_HBM_1_BASE + hbm_dist;
-	else if (start_addr >= V3_HBM_2_BASE && start_addr + size < V3_HBM_2_BASE + V3_HBM_ACTIVE_SIZE)
+	else if (start_addr >= V3_HBM_2_BASE && start_addr + size <= V3_HBM_2_BASE + V3_HBM_ACTIVE_SIZE)
 		*offset = start_addr - V3_HBM_2_BASE + hbm_dist * 2;
-	else if (start_addr >= V3_HBM_3_BASE && start_addr + size < V3_HBM_3_BASE + V3_HBM_ACTIVE_SIZE)
+	else if (start_addr >= V3_HBM_3_BASE && start_addr + size <= V3_HBM_3_BASE + V3_HBM_ACTIVE_SIZE)
 		*offset = start_addr - V3_HBM_3_BASE + hbm_dist * 3;
 	else
 		return -EINVAL;
@@ -1010,6 +1060,7 @@ static int nsysfsmetric_add_ecc_nodes_v3(struct nsysfsmetric_metrics *metrics,
 		pr_err("failed to add hardware node its attributes under stats\n");
 		return -1;
 	}
+	metrics->hardware_node = hardware_node;
 
 	return 0;
 }
@@ -1026,48 +1077,44 @@ static void nsysfsmetric_get_hbm_error_count_v3(struct neuron_device *nd,
                                                  uint32_t *err_count)
 {
 	int ret;
-	uint32_t total_uncorrected_ecc_err_count;
-	uint32_t total_repairable_ecc_err_count;
+	uint32_t total_unrepairable_ecc_err_count = 0;
+	uint32_t total_repairable_ecc_err_count = 0;
 	uint32_t ecc_repair_state;
 
 	*err_count = 0;
 
+	// read regs 17-20
+	fw_io_get_total_ecc_err_counts(nd->npdev.bar0, &total_unrepairable_ecc_err_count, &total_repairable_ecc_err_count);
+
+	// read reg 25
 	ret = fw_io_hbm_uecc_repair_state_read(nd->npdev.bar0, &ecc_repair_state);
 	if (ret) {
 		pr_err("sysfs failed to read HBM ECC repair state from FWIO\n");
 		return;
 	}
-	fw_io_get_total_ecc_err_counts(nd->npdev.bar0, &total_uncorrected_ecc_err_count, &total_repairable_ecc_err_count);
 
-	/*
-	*  HBM Repair State Bitfield notes:
-	*      2 bits to represent the state of hbm repair
-	*      0x0 means no pending repair
-	*      0x1 means pending repair
-	*      0x2 means repair failure
-	*/
-	if (total_uncorrected_ecc_err_count == 0 && ecc_repair_state != 0) {
-		// For legacy firmware, there might be the case that (err count > 0 && repair state == 0), so allow this case
-		// When err count = 0, repair state must be 0x0
-		pr_warn_once("[ND %d] Total Uncorrected ecc err count is %d, but repair state is %d which is invalid. Please contact Neuron for support.\n", nd->device_index, total_uncorrected_ecc_err_count, ecc_repair_state);
-		return;
+	if (ecc_repair_state > 0x2) {
+    	pr_warn_once("[ND %d] HBM unexpected ecc_repair_state: 0x%x\n", nd->device_index, ecc_repair_state);
 	}
 
-	// We did not complete the repair for some reason, in this case we expect that the error count is non-zero since the repairs have
-	// not gone through yet. If it is zero notify the user since this is unexpected.
+
+	if (ecc_repair_state == 0x2) { // repair failure
+		total_unrepairable_ecc_err_count += 1;
+	}
+
 	if (ecc_repair_state == 0x1 && total_repairable_ecc_err_count == 0) {
-		pr_warn_once("[ND %d] HBM repairs were not completed, but no repairable ecc errors were reported, which is invalid. Please contact Neuron for support.\n", nd->device_index);
-		return;
-	} 
-
-	// We failed to repair ECC memory but have not encountered a UECC yet. Proactively notify the user of this since the ECC 
-	// will be more susceptible to errors in the future.
-	if (ecc_repair_state == 0x2 && total_uncorrected_ecc_err_count == 0) {
-		pr_warn_once("[ND %d] HBM repair failed. No uncorrectable ecc errors detected, however memory will be more suseptible to corruption. Please contact Neuron for support.\n", nd->device_index);
-		return;
+		/* Known race condition: it may take upto 5 seconds to have consistent regs, but we can't wait that long 
+		in a sysfs read. Increment repairable UE by 1 */
+		pr_warn_once("[ND %d] HBM pending_repair but no repairable errors\n", nd->device_index);
+		total_repairable_ecc_err_count += 1;
 	}
 
-	*err_count = (repairable) ? total_repairable_ecc_err_count : total_uncorrected_ecc_err_count;
+	if (ecc_repair_state == 0x0 && total_repairable_ecc_err_count > 0) {
+		/* Unexpected / unknown race condition   */
+		pr_warn_once("[ND %d] HBM repairable errors but no pending_repair\n", nd->device_index);
+	}
+
+	*err_count = (repairable) ? total_repairable_ecc_err_count : total_unrepairable_ecc_err_count;
 }
 
 /**
@@ -1538,10 +1585,17 @@ static const struct neuron_ioctl_nc_map_entry nc_mapping_v0_seng_swap[] = {
 static_assert((NC_MAPPING_V0_SENG_SWAP_SIZE == NC_MAPPING_MAX_CORE_COUNT_V3) && (NC_MAPPING_V0_SENG_SWAP_SIZE <= NEURON_NC_MAP_MAX_ENTRIES));
 static const uint32_t neuron_nc_map_die_flip_mask = 0x6;
 
-static bool ndhal_die_flipped(void)
+static bool ndhal_die_flipped(enum neuron_ioctl_nc_mapping_type version)
 {
 	u32 state;
 	s8 node_id;
+
+	if (version == NEURON_IOCTL_NC_MAPPING_TYPE_V1) {
+		if (force_die_flip) {
+			pr_info("Runtime disabled die id flipping. overriding driver force mode");
+		}
+		return false;
+	}
 
 	if (force_die_flip) {
 		return true;
@@ -1559,12 +1613,12 @@ static bool ndhal_die_flipped(void)
 
 static int ncdev_logical_to_physical_nc_map_v3(struct neuron_ioctl_nc_map *map, uint32_t max_num_entries, enum neuron_ioctl_nc_mapping_type version)
 {
-	bool apply_dieflip = ndhal_die_flipped();
+	bool apply_dieflip = ndhal_die_flipped(version);
 	uint32_t entry_idx;
 	uint32_t entries_to_copy = (max_num_entries < NC_MAPPING_MAX_CORE_COUNT_V3) ? max_num_entries : NC_MAPPING_MAX_CORE_COUNT_V3;
 	const struct neuron_ioctl_nc_map_entry *mapping;
 
-	if (version != NEURON_IOCTL_NC_MAPPING_TYPE_V0) {
+	if (version != NEURON_IOCTL_NC_MAPPING_TYPE_V0 && version != NEURON_IOCTL_NC_MAPPING_TYPE_V1) {
 		pr_err("Unsupported Neuron Core Mapping verion %u for v3 arch", version);
 		return -EINVAL;
 	}
@@ -1705,7 +1759,7 @@ static int perf_set_profile_v3(struct neuron_device *nd, uint32_t profile)
 		if (retval == 0) {
 			nd->current_perf_profile = cur_profile;
 		} else {
-			nd->current_perf_profile = 0;
+			nd->current_perf_profile = -1;
 		}
 	}
     return ret;
@@ -1874,6 +1928,7 @@ int ndhal_register_funcs_v3(void) {
 	}
 
 	ndhal->ndhal_arch.platform_type = ndhal_platform_type_v3();
+	ndhal->ndhal_arch.narch_platform_ready = narch_platform_ready_v3;
 	ndhal->ndhal_address_map.pci_host_base = V3_PCIE_A0_BASE;
 	ndhal->ndhal_address_map.mmap_nc_event_offset = V3_MMAP_NC_EVENT_OFFSET;
 	ndhal->ndhal_address_map.mmap_nc_sema_read_offset = V3_MMAP_NC_SEMA_READ_OFFSET;
@@ -1881,7 +1936,6 @@ int ndhal_register_funcs_v3(void) {
 	ndhal->ndhal_address_map.mmap_nc_sema_incr_offset = V3_MMAP_NC_SEMA_INCR_OFFSET;
 	ndhal->ndhal_address_map.mmap_nc_sema_decr_offset = V3_MMAP_NC_SEMA_DECR_OFFSET;
 	ndhal->ndhal_address_map.bar0_misc_ram_offset = V3_MMAP_BAR0_APB_IO_0_MISC_RAM_OFFSET;
-	ndhal->ndhal_address_map.port_1_base = 0ull;
 	ndhal->ndhal_address_map.nc_per_device = V3_NC_PER_DEVICE;
 	ndhal->ndhal_address_map.dev_nc_map = (1 << V3_NC_PER_DEVICE) - 1;
 	ndhal->ndhal_address_map.dice_per_device = V3_NUM_DIE_PER_DEVICE;
@@ -1906,10 +1960,13 @@ int ndhal_register_funcs_v3(void) {
 	ndhal->ndhal_mpset.mpset_set_dram_and_mpset_info = mpset_set_dram_and_mpset_info_v3;
 	ndhal->ndhal_ndmar.ndmar_get_h2t_eng_id = ndmar_get_h2t_eng_id_v3;
 	ndhal->ndhal_ndmar.ndmar_get_h2t_def_qid = ndmar_get_h2t_def_qid_v3;
+	ndhal->ndhal_ndmar.ndmar_ctx_queue_bit = ndmar_ctx_queue_bit_v3;
+	ndhal->ndhal_ndmar.ndmar_ctx_queue_from_bit = ndmar_ctx_queue_from_bit_v3;
 	ndhal->ndhal_ndmar.ndmar_is_h2t_def_q = ndmar_is_h2t_def_q_v3;
 	ndhal->ndhal_ndmar.nr_init_h2t_eng = nr_init_h2t_eng_v3;
 	ndhal->ndhal_ndmar.ndmar_is_nx_ring = ndmar_is_nx_ring_v3;
 	ndhal->ndhal_ndmar.ndmar_quiesce_queues = ndmar_quiesce_queues_v3;
+	ndhal->ndhal_fw_io.new_readless_read_min_api_version = 7;
 	ndhal->ndhal_fw_io.fw_io_topology = fw_io_topology_v3;
 	ndhal->ndhal_fw_io.fw_io_register_readless_read_region = fw_io_register_readless_read_region_v3;
 	ndhal->ndhal_fw_io.fw_io_read_csr_array = fw_io_read_csr_array_v3;
@@ -1922,6 +1979,7 @@ int ndhal_register_funcs_v3(void) {
 	ndhal->ndhal_sysfs_metrics.nsysfsmetric_add_ecc_nodes = nsysfsmetric_add_ecc_nodes_v3;
 	ndhal->ndhal_sysfs_metrics.nsysfsmetric_get_hbm_error_count = nsysfsmetric_get_hbm_error_count_v3;
 	ndhal->ndhal_sysfs_metrics.nsysfsmetric_add_tensor_engine_node = nsysfsmetric_add_tensor_engine_node_v3;
+	ndhal->ndhal_sysfs_metrics.health_status_enabled = enable_sysfs_health_status_nodes;
 	ndhal->ndhal_pci.axi_bar = BAR_UNUSED;
 	ndhal->ndhal_pci.apb_bar = 0;
 	ndhal->ndhal_pci.dram_bar = 4;

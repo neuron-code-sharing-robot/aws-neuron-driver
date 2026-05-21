@@ -20,6 +20,7 @@
 #include "neuron_fw_io.h"
 #include "neuron_dhal.h"
 #include "neuron_nq.h"
+#include "neuron_test.h"
 
 int no_reset = 0;
 module_param(no_reset, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
@@ -116,6 +117,8 @@ static int nr_reset_thread_fn(void *arg)
 																		 (nc_map == NEURON_NC_MAP_DEVICE) ? "device" : "TPB", 
 																 		 request_iter->request_id);)
 
+		ndmar_close_ncs(nd, nc_map);
+
 		ret = ndhal->ndhal_reset.nr_initiate_reset(nd, nc_map);
 		if (ret) {
 			char *reason = (ret == -EINTR) ? "interrupted by driver unload\n" : "failed\n";
@@ -128,7 +131,7 @@ static int nr_reset_thread_fn(void *arg)
 			// If the reset was successfully initiated the 
 			// response we get back is a pass/fail and we don't need to retry.
 			ret = ndhal->ndhal_reset.nr_wait_for_reset_completion(nd);
-			if (ret) {
+			if (ret  || _ntest_trigger(NEURON_TEST_TRIGGER_RST_FAILURE, nd->device_index)) {
 				nr_call_post_reset_config(nd, nc_map, false);
 				ITER_COAL_REQS(request_iter, first_request, last_request,
 					pr_info("nd%d: reset request %u was initiated, but failed to complete\n", nd->device_index, request_iter->request_id);)
@@ -257,9 +260,12 @@ int nr_start_ncs(struct neuron_device *nd, uint32_t nc_map, uint32_t request_id)
 		// perform the driver's reset related activities, then return so
 		// that outside of not resetting HW, everything  else will look natural.
 		//
-		ndmar_init_ncs(nd, NEURON_NC_MAP_DEVICE);
+		ndmar_close_ncs(nd, nc_map);
+		ndmar_init_ncs(nd, nc_map);
 		nr_call_post_reset_config(nd, nc_map, true);
-		nd->device_state = NEURON_DEVICE_STATE_READY;
+		if (request_id == NEURON_RESET_REQUEST_ALL) {
+			nd->device_state = NEURON_DEVICE_STATE_READY;
+		}
 		return 0;
 	}
 

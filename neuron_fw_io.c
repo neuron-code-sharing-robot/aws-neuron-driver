@@ -54,6 +54,21 @@ int fw_io_ecc_read(void *bar0, uint64_t ecc_offset, uint32_t *ecc_err_count)
 	return 0;
 }
 
+int fw_io_misc_ram_reg_read(void *bar0, u64 offset, u32 *val)
+{
+	if (offset % 4 != 0) {
+		pr_err("invalid misc ram offset, needs to be 4 byte aligned\n");
+		return -EPROTO;
+	}
+	void *addr = bar0 + ndhal->ndhal_address_map.bar0_misc_ram_offset + offset;
+	int ret = ndhal->ndhal_fw_io.fw_io_read_csr_array(&addr, val, 1, true);
+	if (ret) {
+		pr_err("failed to read misc ram reg at offset 0x%llx\n", offset);
+		return -EIO;
+	}
+	return 0;
+}
+
 int fw_io_hbm_uecc_repair_state_read(void *bar0, uint32_t *hbm_repair_state)
 {
 	int ret;
@@ -128,6 +143,19 @@ int fw_io_api_version_read(void * bar0, u32 *version)
 	ret = ndhal->ndhal_fw_io.fw_io_read_csr_array(&addr, version, 1, true);
 	if (ret) {
 		pr_err("failed to get api version from the device, ret = %d\n", ret);
+	}
+
+	return ret;
+}
+
+int fw_io_fw_build_read(void *bar0, u32 *fw_build)
+{
+	int ret;
+
+	void *addr = bar0 + ndhal->ndhal_address_map.bar0_misc_ram_offset + FW_IO_REG_FW_BUILD_OFFSET;
+	ret = ndhal->ndhal_fw_io.fw_io_read_csr_array(&addr, fw_build, 1, true);
+	if (ret) {
+		pr_err("failed to get fw build from the device, ret = %d\n", ret);
 	}
 
 	return ret;
@@ -385,7 +413,7 @@ int fw_io_execute_request(struct fw_io_ctx *ctx, u8 command_id, const u8 *req, u
 			goto done;
 		}
 		ctx->fw_io_err_count++;
-		pr_err(KERN_ERR "seq: %u, cmd: %u failed %u\n", ctx->next_seq_num, command_id,
+		pr_err("seq: %u, cmd: %u failed %u\n", ctx->next_seq_num, command_id,
 	       	ctx->response->response_hdr.hdr.error_code);
 		// if we get an unsupported command response, don't retry
 		if (ctx->response->response_hdr.hdr.error_code == FW_IO_UNKNOWN_COMMAND) {
@@ -413,13 +441,13 @@ int fw_io_execute_request_new(struct fw_io_ctx *ctx, u8 command_id, const u8 *re
 
 	ret = fw_io_api_version_read(ctx->bar0, &api_version_num);
 
-	if ((ret != 0) || (api_version_num < FW_IO_NEW_READLESS_READ_MIN_API_VERSION)) {
+	if ((ret != 0) || (api_version_num < ndhal->ndhal_fw_io.new_readless_read_min_api_version)) {
 		pr_info_once("Firmware version %d, using legacy Firmware/Runtime comm framework", api_version_num);
 		return -ENOTSUPP;
 	}
 
 	mutex_lock(&ctx->lock);
-
+	ret = -EIO;
 	u32 retry_count = (command_id < FW_IO_CMD_MAX) ? fw_io_cmd_retry_tbl[command_id] : FW_IO_RD_RETRY;
 	for (i=0; i < retry_count; i++){
 		if (++ctx->next_seq_num == 0)
@@ -463,6 +491,7 @@ int fw_io_execute_request_new(struct fw_io_ctx *ctx, u8 command_id, const u8 *re
 		if (trigger) {
 			if (command_id != FW_IO_CMD_POST_TO_CW)
 				pr_err("seq: %u, cmd: %u timed out\n", ctx->next_seq_num, command_id);
+			ret = -ETIMEDOUT;
 			continue;
 		}
 		
@@ -473,6 +502,7 @@ int fw_io_execute_request_new(struct fw_io_ctx *ctx, u8 command_id, const u8 *re
 		if (resp_header.hdr.sequence_number != ctx->next_seq_num) {
 			if (command_id != FW_IO_CMD_POST_TO_CW)
 				pr_err("seq: %u, cmd: %u seq mismatch\n", ctx->next_seq_num, command_id);
+			ret = -EPROTO;
 			continue;
 		}
 
@@ -496,8 +526,8 @@ int fw_io_execute_request_new(struct fw_io_ctx *ctx, u8 command_id, const u8 *re
 		}
 
 		ctx->fw_io_err_count++;
-		pr_err(KERN_ERR "seq: %u, cmd: %u failed %u\n", ctx->next_seq_num, command_id, resp_header.hdr.error_code);
-		ret = -1;
+		pr_err("seq: %u, cmd: %u failed %u\n", ctx->next_seq_num, command_id, resp_header.hdr.error_code);
+		ret = -EIO;
 		if (resp_header.hdr.error_code == FW_IO_UNKNOWN_COMMAND) {
 			break;
 		}
@@ -775,7 +805,7 @@ void fw_io_destroy(struct fw_io_ctx *ctx)
 	kfree(ctx);
 }
 
-static inline uint32_t uncorrectable_ecc_err_count(uint32_t api_version, uint32_t ecc_err_count) {
+static inline uint32_t unrepairable_ecc_err_count(uint32_t api_version, uint32_t ecc_err_count) {
 	// API Version<6:  bitfield[15:0] Uncorrectable Errors
 	// API Version>=6: bitfield[15:12] Uncorrectable Errors
 	return (api_version >= 6) ? ((ecc_err_count >> 12) & 0xf) : (ecc_err_count & 0xffff);
@@ -787,8 +817,8 @@ static inline uint32_t repairable_ecc_err_count(uint32_t api_version, uint32_t e
 	return (api_version >= 6) ? (ecc_err_count & 0xfff) : 0;
 }
 
-void fw_io_get_total_ecc_err_counts(void *bar0, uint32_t *ue_ecc_count, uint32_t *repairable_ecc_count) {
-	uint32_t total_uncorrected_ecc_err_count = 0;
+void fw_io_get_total_ecc_err_counts(void *bar0, uint32_t *unrepairable_ecc_count, uint32_t *repairable_ecc_count) {
+	uint32_t total_unrepairable_ecc_err_count = 0;
 	uint32_t total_repairable_ecc_err_count = 0;
 	uint32_t channel = 0;
 	uint32_t ecc_err_count = 0;
@@ -804,11 +834,11 @@ void fw_io_get_total_ecc_err_counts(void *bar0, uint32_t *ue_ecc_count, uint32_t
 		if (ret) {
 			pr_err("sysfs failed to read ECC HBM%u error from FWIO\n", channel);
 		} else if (ecc_err_count != 0xdeadbeef) {
-			total_uncorrected_ecc_err_count += uncorrectable_ecc_err_count(api_version, ecc_err_count);
+			total_unrepairable_ecc_err_count += unrepairable_ecc_err_count(api_version, ecc_err_count);
 			total_repairable_ecc_err_count += repairable_ecc_err_count(api_version, ecc_err_count);
 		}
 	}
-	*ue_ecc_count = total_uncorrected_ecc_err_count;
+	*unrepairable_ecc_count = total_unrepairable_ecc_err_count;
 	*repairable_ecc_count = total_repairable_ecc_err_count;
 }
 

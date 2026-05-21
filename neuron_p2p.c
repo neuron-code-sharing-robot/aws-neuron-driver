@@ -17,9 +17,6 @@
 #include "neuron_p2p.h"
 #include "neuron_pci.h"
 
-#define NEURON_P2P_HUGE_PAGE_SZ 0x200000
-#define NEURON_P2P_HUGE_PAGE_SZ_USAGE_THRESHOLD 0x10000000
-
 /*
  * Registers the VA with the callback and also returns the PA
  */

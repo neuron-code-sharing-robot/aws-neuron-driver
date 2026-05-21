@@ -174,8 +174,8 @@ enum {
 	// All devices will have the D0 offset.  Devices with two dice will also have the D1 offset.
 	FW_IO_REG_POWER_UTIL_D0_OFFSET = 0x54, // 21 * 4 bytes
 	FW_IO_REG_POWER_UTIL_D1_OFFSET = 0x58, // 22 * 4 bytes
-
 	FW_IO_REG_HBM_REPAIR_STATE_OFFSET = 0x64, // 25 * 4 bytes
+	FW_IO_REG_FW_BUILD_OFFSET = 0x74, // 29 * 4 bytes
 											  //
 
 	FW_IO_REG_RESERVATION_ID_HI = 0x80,	// 32 * 4 bytes
@@ -272,10 +272,6 @@ struct fw_io_ctx {
 
 // max number of registers can be read in single function call
 #define FW_IO_MAX_READLESS_READ_REGISTER_COUNT 100
-
-// Min Firmware API version for new readless read framework
-#define FW_IO_NEW_READLESS_READ_MIN_API_VERSION 7
-#define FW_IO_POWER_MIN_API_VERSION 3
 
 
 /**
@@ -468,6 +464,14 @@ int fw_io_device_power_read(void *bar0, u32 *power, unsigned die);
 int fw_io_api_version_read(void * bar0, u32 *version);
 
 /**
+ * fw_io_fw_build_read() - Read the firmware build number
+ * @param bar - from bar
+ * @param fw_build  - output firmware build number
+ * @return  0 on success.
+ */
+int fw_io_fw_build_read(void *bar0, u32 *fw_build);
+
+/**
  * fw_io_device_id_write() - Read device id
  * @param bar - to bar
  * @param device_id  - output device id
@@ -498,6 +502,16 @@ u64 fw_io_get_err_count(struct fw_io_ctx *ctx);
 int fw_io_ecc_read(void *bar0, uint64_t ecc_offset, uint32_t *ecc_err_count);
 
 /**
+ * fw_io_misc_ram_reg_read() - Read a single 32-bit misc RAM register by byte offset
+ *
+ * @param bar0: mapped BAR0 base
+ * @param offset: byte offset of the register within the misc RAM block (e.g., FW_IO_REG_*_OFFSET)
+ * @param val: output register value
+ * @return 0 on success
+ */
+int fw_io_misc_ram_reg_read(void *bar0, u64 offset, u32 *val);
+
+/**
  * fw_io_serial_number_read() - Read serial number
  * 
  * @param bar0: from bar
@@ -509,10 +523,10 @@ int fw_io_serial_number_read(void *bar0, uint64_t *serial_number);
 /**
  * fw_io_get_total_ecc_err_counts() - Get UE ecc error count
  * @param bar0: from bar
- * @param ue_ecc_count: Pointer to the ue counter
- * @param repairable_err_count: Pointer to the repairable counter
+ * @param unrepairable_ecc_count: Pointer to the unrepairable ue counter
+ * @param repairable_err_count: Pointer to the repairable ue counter
  */
-void fw_io_get_total_ecc_err_counts(void *bar0, uint32_t *ue_ecc_count, uint32_t *repairable_ecc_count);
+void fw_io_get_total_ecc_err_counts(void *bar0, uint32_t *unrepairable_ecc_count, uint32_t *repairable_ecc_count);
 
 /**
  * fw_io_hbm_uecc_repair_state_read() - Get HBM UE ecc repair state

@@ -12,6 +12,7 @@
 
 #include "neuron_device.h"
 #include "neuron_ds.h"
+#include "neuron_fw_io.h"
 #include "neuron_sysfs_metrics.h"
 #include "neuron_dhal.h"
 #include "neuron_power.h"
@@ -149,6 +150,31 @@ static const nsysfsmetric_attr_info_t ecc_attrs_info_tbl[] = {
     ATTR_INFO("mem_ecc_repairable_uncorrected",  NON_NDS_ID_TO_SYSFS_METRIC_ID(NON_NDS_COUNTER_ECC_REPAIRABLE_HBM_UNCORRECTED),  OTHER),
 };
 static const int ecc_attrs_info_tbl_cnt = sizeof(ecc_attrs_info_tbl) / sizeof(nsysfsmetric_attr_info_t);
+
+struct health_status_reg_map {
+    enum health_status_cache_slot slot;
+    u64 offset;
+    bool is_err_metric;
+};
+
+static const struct health_status_reg_map health_status_reg_tbl[] = {
+    { HEALTH_STATUS_SLOT_SRAM_ECC,         FW_IO_REG_SRAM_ECC_OFFSET,           true },
+    { HEALTH_STATUS_SLOT_HBM0_ECC,         FW_IO_REG_HBM0_ECC_OFFSET,           true },
+    { HEALTH_STATUS_SLOT_HBM1_ECC,         FW_IO_REG_HBM1_ECC_OFFSET,           true },
+    { HEALTH_STATUS_SLOT_HBM2_ECC,         FW_IO_REG_HBM2_ECC_OFFSET,           true },
+    { HEALTH_STATUS_SLOT_HBM3_ECC,         FW_IO_REG_HBM3_ECC_OFFSET,           true },
+    { HEALTH_STATUS_SLOT_HBM_REPAIR_STATE, FW_IO_REG_HBM_REPAIR_STATE_OFFSET,   true },
+    { HEALTH_STATUS_SLOT_FW_API_VERSION,   FW_IO_REG_API_VERSION_OFFSET,        false },
+};
+static const int health_status_reg_tbl_cnt = sizeof(health_status_reg_tbl) / sizeof(health_status_reg_tbl[0]);
+
+static const nsysfsmetric_attr_info_t health_status_attrs_info_tbl[] = {
+    ATTR_INFO("hbm_ecc_err_count",             NON_NDS_ID_TO_SYSFS_METRIC_ID(NON_NDS_HEALTH_STATUS_HBM_UE_COUNT),             CACHED_VALUES),
+    ATTR_INFO("repairable_hbm_ecc_err_count",  NON_NDS_ID_TO_SYSFS_METRIC_ID(NON_NDS_HEALTH_STATUS_REPAIRABLE_HBM_UE_COUNT),  CACHED_VALUES),
+    ATTR_INFO("sram_ecc_err_count",            NON_NDS_ID_TO_SYSFS_METRIC_ID(NON_NDS_HEALTH_STATUS_SRAM_UE_COUNT),            CACHED_VALUES),
+    ATTR_INFO("hw_error_event",                NON_NDS_ID_TO_SYSFS_METRIC_ID(NON_NDS_HEALTH_STATUS_HW_ERROR_EVENT),           CACHED_VALUES),
+};
+static const int health_status_attrs_info_tbl_cnt = sizeof(health_status_attrs_info_tbl) / sizeof(nsysfsmetric_attr_info_t);
 
 static const nsysfsmetric_attr_info_t root_arch_node_attrs_info_tbl[] = {
     ATTR_INFO("arch_type", NON_NDS_ID_TO_SYSFS_METRIC_ID(NON_NDS_OTHER_NEURON_ARCH_TYPE), OTHER),
@@ -399,6 +425,46 @@ static ssize_t nsysfsmetric_show_nrt_other_metrics(struct nsysfsmetric_metrics *
 	return len;
 }
 
+static ssize_t nsysfsmetric_show_cached_values_metrics(struct nsysfsmetric_metrics *sysfs_metrics,
+                                                       struct metric_attribute *attr,
+                                                       char *buf)
+{
+    u32 value = 0;
+
+    switch (attr->metric_id) {
+        case NON_NDS_ID_TO_SYSFS_METRIC_ID(NON_NDS_HEALTH_STATUS_SRAM_UE_COUNT):
+            value = READ_ONCE(sysfs_metrics->cached_health_regs[HEALTH_STATUS_SLOT_SRAM_ECC]);
+            return nsysfsmetric_sysfs_emit(buf, "%u\n", value & 0xffff); // Lower 16 bits
+        case NON_NDS_ID_TO_SYSFS_METRIC_ID(NON_NDS_HEALTH_STATUS_HBM_UE_COUNT):
+            // TODO: Use cached HEALTH_STATUS_SLOT_FW_API_VERSION
+            // For now, safe to assume api_version >= 6
+            value = 0;
+            value += (((READ_ONCE(sysfs_metrics->cached_health_regs[HEALTH_STATUS_SLOT_HBM0_ECC])) >> 12) & 0xf);
+            value += (((READ_ONCE(sysfs_metrics->cached_health_regs[HEALTH_STATUS_SLOT_HBM1_ECC])) >> 12) & 0xf);
+            value += (((READ_ONCE(sysfs_metrics->cached_health_regs[HEALTH_STATUS_SLOT_HBM2_ECC])) >> 12) & 0xf);
+            value += (((READ_ONCE(sysfs_metrics->cached_health_regs[HEALTH_STATUS_SLOT_HBM3_ECC])) >> 12) & 0xf);
+            if ((READ_ONCE(sysfs_metrics->cached_health_regs[HEALTH_STATUS_SLOT_HBM_REPAIR_STATE]) & 0x3) == 0x2)
+                value +=1;
+
+            return nsysfsmetric_sysfs_emit(buf, "%u\n", value);
+        case NON_NDS_ID_TO_SYSFS_METRIC_ID(NON_NDS_HEALTH_STATUS_REPAIRABLE_HBM_UE_COUNT):
+            value = 0;
+            value += ((READ_ONCE(sysfs_metrics->cached_health_regs[HEALTH_STATUS_SLOT_HBM0_ECC])) & 0xfff);
+            value += ((READ_ONCE(sysfs_metrics->cached_health_regs[HEALTH_STATUS_SLOT_HBM1_ECC])) & 0xfff);
+            value += ((READ_ONCE(sysfs_metrics->cached_health_regs[HEALTH_STATUS_SLOT_HBM2_ECC])) & 0xfff);
+            value += ((READ_ONCE(sysfs_metrics->cached_health_regs[HEALTH_STATUS_SLOT_HBM3_ECC])) & 0xfff);
+            if ((READ_ONCE(sysfs_metrics->cached_health_regs[HEALTH_STATUS_SLOT_HBM_REPAIR_STATE]) & 0x3) == 0x1)
+                value +=1;
+
+            return nsysfsmetric_sysfs_emit(buf, "%u\n", value);
+        case NON_NDS_ID_TO_SYSFS_METRIC_ID(NON_NDS_HEALTH_STATUS_HW_ERROR_EVENT):
+            return nsysfsmetric_sysfs_emit(buf, "%u\n", READ_ONCE(sysfs_metrics->hw_error_event_count));
+        default:
+            pr_err("cannot show sysfs metrics for metric_id=%d of attr_type CACHED_VALUES\n", attr->metric_id);
+            return 0;
+    }
+}
+
 static ssize_t nsysfsmetric_set_nrt_total_metrics(struct nsysfsmetric_metrics *sysfs_metrics,
                                                     struct metric_attribute *attr,
                                                     const char *buf, size_t size)
@@ -503,6 +569,11 @@ static struct metric_attribute *nsysfsmetric_create_attr(const char *metric_name
         case OTHER:
             metric_attr->show = nsysfsmetric_show_nrt_other_metrics;
             metric_attr->store = nsysfsmetric_set_nrt_other_metrics;			
+            break;
+        case CACHED_VALUES:
+            metric_attr->attr.mode = VERIFY_OCTAL_PERMISSIONS(S_IRUGO);
+            metric_attr->show = nsysfsmetric_show_cached_values_metrics;
+            metric_attr->store = NULL;
             break;
         default:
             metric_attr->show = NULL;
@@ -934,6 +1005,14 @@ int nsysfsmetric_register(struct neuron_device *nd, struct kobject *neuron_devic
         return ret;
     }
 
+    // neuron{0, 1, ...}/stats/hardware/health_status/
+    if (ndhal->ndhal_sysfs_metrics.health_status_enabled && metrics->hardware_node) {
+        ret = nsysfsmetric_add_health_status_nodes(metrics, metrics->hardware_node);
+        if (ret) {
+            return ret;
+        }
+    }
+
     // neuron{0, 1, ...}/neuron_core{0, 1, ...}/
     ret = nsysfsmetric_init_and_add_nc_default_nodes(nd, &metrics->root);
     if (ret) {
@@ -963,6 +1042,8 @@ static void nsysfsmetric_destroy_counters(struct nsysfsmetric_metrics *metrics)
     memset(metrics->nrt_metrics, 0, sizeof(metrics->nrt_metrics));
     memset(metrics->nrt_nd_metrics, 0, sizeof(metrics->nrt_nd_metrics));
     memset(metrics->dev_metrics, 0, sizeof(metrics->dev_metrics));
+    metrics->hardware_node = NULL;
+    metrics->health_status_node = NULL;
 }
 
 static void nsysfsmetric_destroy_nodes(struct nsysfsmetric_node *node, bool acquire_lock)
@@ -995,6 +1076,53 @@ void nsysfsmetric_destroy(struct neuron_device *nd)
     nsysfsmetric_destroy_counters(&nd->sysfs_metrics);
     nsysfsmetric_destroy_nodes(&nd->sysfs_metrics.root, false);
     mutex_unlock(&nd->sysfs_metrics.root.lock);
+}
+
+/*
+ * Reads a configured subset of misc RAM registers and updates the cache exposed via
+ * stats/hardware/health_status/. Bumps hw_error_event_count and issues sysfs_notify on any change.
+ * Invoked periodically from the metrics thread.
+ */
+void nsysfsmetric_health_status_tick(struct neuron_device *nd)
+{
+    struct nsysfsmetric_metrics *metrics = &nd->sysfs_metrics;
+    int i;
+    bool changed = false;
+
+    if (!ndhal->ndhal_sysfs_metrics.health_status_enabled)
+        return;
+
+    for (i = 0; i < health_status_reg_tbl_cnt; i++) {
+        u32 val;
+        int ret = fw_io_misc_ram_reg_read(nd->npdev.bar0, health_status_reg_tbl[i].offset, &val);
+        if (ret)
+            continue; // TODO: figure out how to communicate to sysfs readers that read failed
+
+        if (val != READ_ONCE(metrics->cached_health_regs[health_status_reg_tbl[i].slot])) {
+            WRITE_ONCE(metrics->cached_health_regs[health_status_reg_tbl[i].slot], val);
+            if (health_status_reg_tbl[i].is_err_metric) {
+                changed = true;
+            }
+        }
+    }
+
+    if (changed && metrics->health_status_node) {
+        // This function is the only writer, don't need atomic update, just volatile (READ_ONCE/WRITE_ONCE)
+        WRITE_ONCE(metrics->hw_error_event_count, READ_ONCE(metrics->hw_error_event_count) + 1);
+        sysfs_notify(&metrics->health_status_node->kobj, NULL, "hw_error_event");
+    }
+}
+
+int nsysfsmetric_add_health_status_nodes(struct nsysfsmetric_metrics *metrics, struct nsysfsmetric_node *hardware_node)
+{
+    struct nsysfsmetric_node *node = nsysfsmetric_init_and_add_one_node(metrics, hardware_node,
+            "health_status", false, -1, health_status_attrs_info_tbl_cnt, health_status_attrs_info_tbl);
+    if (!node) {
+        pr_err("failed to add health_status node under stats/hardware\n");
+        return -1;
+    }
+    metrics->health_status_node = node;
+    return 0;
 }
 
 int nsysfsmetric_init_and_add_dynamic_counter_nodes(struct neuron_device *nd, uint64_t ds_val)

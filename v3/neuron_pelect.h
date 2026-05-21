@@ -85,6 +85,12 @@ int npe_get_pod_status(u32 *state, u8 *node_id);
 int npe_pod_ctrl(struct neuron_device *nd, u32 ctrl, enum neuron_ultraserver_mode mode, u32 timeout, u32 *state);
 
 /**
+ * npe_platform_ready() - return platform readiness for specified operation
+ *
+ */
+int npe_platform_ready(struct neuron_device *nd, enum neuron_platform_operation_type platform_operation);
+
+/**
  * npe_class_node_id_show_data() - return sysfs class node_id
  *
  * @buf:		    sysfs buffer

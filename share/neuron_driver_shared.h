@@ -18,6 +18,8 @@ enum neuron_driver_feature_flag {
 	NEURON_DRIVER_FEATURE_MEM_ALLOC64 = 1ull << 6,
 	NEURON_DRIVER_FEATURE_CONTIGUOUS_SCRATCHPAD = 1ull << 7,
 	NEURON_DRIVER_FEATURE_ZEROCOPY = 1ull << 8,
+	NEURON_DRIVER_FEATURE_PINNED_HOST_MEM = 1ull << 9,
+	NEURON_DRIVER_FEATURE_ALLOC_WITH_PA   = 1ull << 10,
 };
 
 // FIXME  this should be more generic - like node type.
@@ -189,6 +191,7 @@ struct neuron_ioctl_mem_chunk_info {
 #define NEURON_NC_MAP_MAX_ENTRIES 128
 enum neuron_ioctl_nc_mapping_type {
     NEURON_IOCTL_NC_MAPPING_TYPE_V0 = 0,           // seng swap mapping
+    NEURON_IOCTL_NC_MAPPING_TYPE_V1 = 1,           // seng swap mapping but disable die-id flipping in ultra-server nodes.
 };
 struct neuron_ioctl_nc_map_entry {
     __u32 device_id;
@@ -210,7 +213,7 @@ typedef struct neuron_memcpy_batch {
 	void *context;                  // [in] TBD. opaque context pointer passed back in completion queue
 } neuron_memcpy_batch_t;
 
-/* H2D Completion Queue Entry (CQE) */
+/* H2D DMA Completion Queue Entry (CQE) */
 typedef struct neuron_h2d_dma_compl_queue_entry {
     __u64 sequence_num; // Sequence number for the submitted IO request from runtime (0 means empty slot).
     __s64 compl_ret;    // Completion status for the request (0 success; negative errno on failure; positive to be used for future).

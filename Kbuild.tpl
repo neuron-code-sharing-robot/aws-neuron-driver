@@ -13,11 +13,11 @@ neuron-objs += neuron_fw_io.o
 neuron-objs += neuron_dmabuf.o
 neuron-objs += neuron_log.o
 neuron-objs += neuron_power.o
-neuron-objs += neuron_test.o
 neuron-objs += vc/neuron_dhal_vc.o
 neuron-objs += v2/notific.o v2/neuron_dhal_v2.o
 neuron-objs += v3/notific.o v3/neuron_dhal_v3.o v3/neuron_pelect.o
 neuron-objs += v4/neuron_dhal_v4.o
+{extra-objs}
 ccflags-y += -O3 -Wall -Werror -Wno-declaration-after-statement -Wunused-macros -Wunused-local-typedefs
 ccflags-y += -I$(src)/
 ccflags-y += $(call cc-option,-march=armv8.2-a)

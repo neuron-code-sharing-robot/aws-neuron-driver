@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/sh
 
 NAME=MODULE_NAME
 VERSION=MODULE_VERSION

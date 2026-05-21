@@ -11,6 +11,9 @@
 #include <linux/mm.h>
 #include <linux/sched/mm.h>
 #include <linux/bitops.h>
+#include <linux/hashtable.h>
+#include <linux/kref.h>
+
 
 #include "udma/udma.h"
 #include "neuron_trace.h"
@@ -32,6 +35,37 @@ MODULE_PARM_DESC(zerocopy_trn1_override, "override zerocopy for trn1");
 //#define NUNUSED	__attribute__ ((unused))
 
 struct neuron_device;
+
+/* data structures for explicit pin/unpin API */
+
+/**
+ * struct neuron_pinned_mem - Tracks a pre-pinned host memory region
+ * @va: User virtual address that was pinned (lookup key)
+ * @size: Size of the pinned region in bytes
+ * @nr_pages: Number of pages pinned
+ * @pages: Array of pinned page pointers
+ * @rb_node: Red-black tree node for efficient VA lookup
+ *
+ * Process isolation is structural: each process has its own rbtree
+ * in the global hash table, so no pid field is needed here.
+ */
+struct neuron_pinned_mem {
+	u64 va;                    /* lookup key - user virtual address */
+	u64 size;
+	unsigned long nr_pages;
+	struct page **pages;
+	struct rb_node rb_node;    /* for VA-based lookup */
+};
+
+/* Per-process pinned memory state */
+struct neuron_pinned_mem_process {
+	pid_t pid;
+	struct rb_root root;          /* rbtree of pinned regions for this process */
+	struct mutex lock;            /* protects this process's rbtree */
+	struct kref refcount;         /* lifetime management; freed when last ref drops */
+	struct hlist_node hash_node;  /* for hash table lookup */
+};
+
 
 static void ndma_ack_completed_desc(struct ndma_eng *eng, struct ndma_ring *ring, u32 count)
 {
@@ -935,6 +969,10 @@ struct ndma_h2t_zcdma_context {
 	struct page         **page_list;          // page structures tracking our pinned pages;
 											  // managed by page_list_pool in ctx queue
 	enum ndma_zcdma_state state;              // state of this transfer
+	struct neuron_pinned_mem_process *prepin_proc;	// ref counted ptr to per process store of pinned memories
+										      //  when set indicates that 1/ the context uses pre-pinned mem and it should not be unpinned
+											  //  2/ prevents process exit cleanup from unpinning the memory while used by the context
+	pid_t				pid;				  // PID of the process that initiated the copy
 
 	// Completion-related
 	void                 *completion_ptr;     // completion buffer pointer;
@@ -946,20 +984,29 @@ struct ndma_h2t_zcdma_context {
 	struct mm_struct     *mm;                 // mm that owns the user buffers
 };
 
+static void ndma_pinned_mem_process_release(struct kref *kref);
+
 static void ndma_zc_release_ctx(struct ndma_h2t_zcdma_context *ctx, u64 *nr_pinned_pages)
 {
 	// do not free or set completion_ptr null. it is managed by completion_pool in ctx queue
 	// do not free or set page_list null. it is managed by page_list_pool in ctx queue
 
 	if (ctx->state >= NDMA_PINNED_UNSUBMITTED) {
-		if (ctx->direction) {
-			unpin_user_pages(ctx->page_list, ctx->nr_pages);
+		/* Only unpin if we pinned it ourselves (not pre-pinned memory) */
+		if (!ctx->prepin_proc) {
+			if (ctx->direction) {
+				unpin_user_pages(ctx->page_list, ctx->nr_pages);
+			} else {
+				unpin_user_pages_dirty_lock(ctx->page_list, ctx->nr_pages, true);
+			}
 		} else {
-			unpin_user_pages_dirty_lock(ctx->page_list, ctx->nr_pages, true);
+			kref_put(&ctx->prepin_proc->refcount, ndma_pinned_mem_process_release);
 		}
+
 		*nr_pinned_pages -= ctx->nr_pages;
 	}
 	ctx->nr_pages = 0;
+	ctx->prepin_proc = NULL;
 
 	if (ctx->mm) {
 		mmput(ctx->mm);
@@ -1300,7 +1347,7 @@ int ndma_ctx_queue_init(struct ndma_ctx_queue *queue)
 	}
 
 	// allocate page_list arrays in one contiguous pool, and let each entry point to its slice
-	queue->page_list_pool = kcalloc(capacity * NDMA_ZC_PAGES_PER_XFER, sizeof(struct page *), GFP_KERNEL);
+	queue->page_list_pool = kvcalloc(capacity * NDMA_ZC_PAGES_PER_XFER, sizeof(struct page *), GFP_KERNEL);
 	if (!queue->page_list_pool) {
 		pr_err("failed to allocate ctx queue page_list pool\n");
 		goto err;
@@ -1321,7 +1368,7 @@ err:
 		queue->completion_pool = NULL;
 	}
 	if (queue->page_list_pool) {
-		kfree(queue->page_list_pool);
+		kvfree(queue->page_list_pool);
 		queue->page_list_pool = NULL;
 	}
 	if (queue->entries) {
@@ -1333,6 +1380,10 @@ err:
 
 void ndma_ctx_queue_free(struct ndma_eng *eng, struct ndma_ring *ring, struct ndma_ctx_queue *queue)
 {
+	int bit = ndhal->ndhal_ndmar.ndmar_ctx_queue_bit(eng->eng_id, ring->qid);
+
+	atomic64_andnot(BIT_ULL(bit), &eng->nd->dma_cmpltn_thread.nonempty_ctxq_bitmap);
+
 	if (!queue) {
 		return;
 	}
@@ -1346,7 +1397,7 @@ void ndma_ctx_queue_free(struct ndma_eng *eng, struct ndma_ring *ring, struct nd
 		queue->completion_pool = NULL;
 	}
 	if (queue->page_list_pool) {
-		kfree(queue->page_list_pool);
+		kvfree(queue->page_list_pool);
 		queue->page_list_pool = NULL;
 	}
 	memset(queue, 0, sizeof(*queue));
@@ -1533,6 +1584,8 @@ static bool ndma_zc_should_wait(struct ndma_eng *eng,
 	return false;
 }
 
+static bool ndma_pinned_mem_try_populate(pid_t pid, u64 va, u64 size, struct page **page_list, int nr_pages, struct neuron_pinned_mem_process **prepin_proc);
+
 static int ndma_zerocopy_pin_pages(int nd_id,
 								   u32 nc_id,
 								   struct ndma_ctx_queue *ctx_queue,
@@ -1540,6 +1593,16 @@ static int ndma_zerocopy_pin_pages(int nd_id,
 								   bool use_remote_pin)
 {
 	int nr_pinned = 0;
+	struct neuron_pinned_mem_process *prepin_proc = NULL;
+
+	/* Check if this VA range is in pre-pinned memory */
+	if (ndma_pinned_mem_try_populate(dma_ctx->pid, (u64)dma_ctx->host_addr, dma_ctx->size,
+					 dma_ctx->page_list, dma_ctx->nr_pages, &prepin_proc)) {
+		dma_ctx->prepin_proc = prepin_proc;
+		ctx_queue->nr_pinned_pages += dma_ctx->nr_pages;
+		dma_ctx->state = NDMA_PINNED_UNSUBMITTED;
+		return 0;
+	}
 
 	if (use_remote_pin) {
 		if (!dma_ctx->mm) {
@@ -1627,6 +1690,13 @@ int ndma_zerocopy_submit(struct neuron_device *nd,
 		return -ENOENT;
 	}
 
+	if (async) {
+		ret = ndma_h2d_create_cmpltn_thread(nd);
+		if (ret) {
+			return ret;
+		}
+	}
+
 	mutex_lock(&ring->h2t_ring_lock);
 
 	for (i = 0; i < num_ops; i++) {
@@ -1685,6 +1755,7 @@ int ndma_zerocopy_submit(struct neuron_device *nd,
 				cur_ctx->state          = NDMA_UNPINNED;
 				cur_ctx->nr_desc        = 0; // Set by ndma_build_n_issue_zc_descs().
 				cur_ctx->mm             = NULL;
+				cur_ctx->pid		    = task_tgid_nr(current);
 				cur_ctx->sequence_num   = sequence_num;
 
 				/* Pin now if possible; otherwise capture mm for remote pinning (async only). */
@@ -1770,25 +1841,33 @@ done:
 	if (ret) {
 		ndma_ctx_queue_drain(eng, ring, ctx_queue);
 	}
+
 	mutex_unlock(&ring->h2t_ring_lock);
+
+	if (!ret && async) {
+		int bit = ndhal->ndhal_ndmar.ndmar_ctx_queue_bit(eng_id, qid);
+		atomic64_or(BIT_ULL(bit), &nd->dma_cmpltn_thread.nonempty_ctxq_bitmap); // set the bit for this queue
+		wake_up(&nd->dma_cmpltn_thread.wait_queue);
+	}
+
 	return ret;
 }
 
 /* The completion flow for completion, remote pinning, and submission. Async IO only */
-static __maybe_unused int ndma_zerocopy_complete(struct neuron_device *nd,
-												 struct ndma_eng *eng,
-												 struct ndma_ring *ring,
-												 bool *did_work)
+static int ndma_zerocopy_complete(struct neuron_device *nd,
+								  struct ndma_eng *eng,
+								  struct ndma_ring *ring,
+								  u64 *nonempty_ctxq_bitmap_copy)
 {
 	int ret = 0;
 	int err = 0;
+	bool did_work = false;
 	struct ndma_ctx_queue *ctx_queue = NULL;
 	u32 desc_threshold = NDMA_ZC_DESC_WAIT_THRESHOLD_LO;
 
-	if (!ring || !did_work) {
+	if (!ring) {
 		return -EINVAL;
 	}
-	*did_work = false;
 
 	ctx_queue = &ring->dma_ctx_queue;
 
@@ -1799,7 +1878,12 @@ static __maybe_unused int ndma_zerocopy_complete(struct neuron_device *nd,
 		if (ndma_ctx_queue_submitted_empty(ctx_queue)) {
 			break;
 		}
-		if (*did_work && !ndma_zc_should_wait(eng, ring, ctx_queue, &desc_threshold)) {
+		/*
+		 * Async completion must always retire at least one submitted context.
+		 * Only fall back to the wait-throttling heuristic after we have made
+		 * some forward progress in this pass.
+		 */
+		if (did_work && !ndma_zc_should_wait(eng, ring, ctx_queue, &desc_threshold)) {
 			break;
 		}
 		struct ndma_h2t_zcdma_context *submitted_ctx = ndma_ctx_queue_pop_submitted(ctx_queue);
@@ -1815,8 +1899,7 @@ static __maybe_unused int ndma_zerocopy_complete(struct neuron_device *nd,
 		}
 
 		ndma_zc_release_ctx(submitted_ctx, &ctx_queue->nr_pinned_pages);
-
-		*did_work = true;
+		did_work = true;
 	}
 
 	/* 2) Submit pinned but unsubmitted contexts */
@@ -1836,8 +1919,7 @@ static __maybe_unused int ndma_zerocopy_complete(struct neuron_device *nd,
 		} else {
 			ndma_ctx_queue_inc_first_pinned_unsubmitted(ctx_queue);
 		}
-
-		*did_work = true;
+		did_work = true;
 	}
 
 	/* 3) Remote pin unpinned contexts */
@@ -1857,10 +1939,478 @@ static __maybe_unused int ndma_zerocopy_complete(struct neuron_device *nd,
 		} else {
 			ndma_ctx_queue_inc_first_unpinned(ctx_queue);
 		}
-
-		*did_work = true;
+		did_work = true;
 	}
 
 	mutex_unlock(&ring->h2t_ring_lock);
+
+	if (ndma_ctx_queue_is_empty(ctx_queue)) {
+		int bit = ndhal->ndhal_ndmar.ndmar_ctx_queue_bit(eng->eng_id, ring->qid);
+		*nonempty_ctxq_bitmap_copy &= ~BIT_ULL(bit);
+	}
+
 	return err;
+}
+
+static int ndma_h2d_cmpltn_thread_fn(void *arg)
+{
+	struct neuron_device *nd = (struct neuron_device *)arg;
+	int ret = 0;
+
+	while (!kthread_should_stop() && !nd->dma_cmpltn_thread.stop) {
+		wait_event_interruptible(nd->dma_cmpltn_thread.wait_queue,
+								 nd->dma_cmpltn_thread.stop || atomic64_read(&nd->dma_cmpltn_thread.nonempty_ctxq_bitmap) != 0);
+		if (kthread_should_stop() || nd->dma_cmpltn_thread.stop) {
+			break;
+		}
+		u64 bitmap = atomic64_xchg(&nd->dma_cmpltn_thread.nonempty_ctxq_bitmap, 0);
+
+		while (bitmap) {
+			int bit = __ffs64(bitmap);
+			u32 eng_id;
+			u32 qid;
+			struct ndma_eng *eng;
+			struct ndma_ring *ring;
+
+			ndhal->ndhal_ndmar.ndmar_ctx_queue_from_bit(bit, &eng_id, &qid);
+
+			eng = &nd->ndma_engine[eng_id];
+			ring = &eng->queues[qid].ring_info;
+			ret = ndma_zerocopy_complete(nd, eng, ring, &bitmap);
+			if (ret) {
+				pr_err("dma completion thread failed to process ctx queue for eng %d q %d: %d\n", eng_id, qid, ret);
+			}
+		}
+	}
+
+	return ret;
+}
+
+int ndma_h2d_create_cmpltn_thread(struct neuron_device *nd)
+{
+	int ret = 0;
+	struct task_struct *thread;
+
+	if (READ_ONCE(nd->dma_cmpltn_thread.thread)) {
+		return 0;
+	}
+
+	mutex_lock(&nd->lock);
+
+	if (nd->dma_cmpltn_thread.thread) {
+		/* thread already created */
+		goto out;
+	}
+
+	nd->dma_cmpltn_thread.stop = false;
+	init_waitqueue_head(&nd->dma_cmpltn_thread.wait_queue);
+	atomic64_set(&nd->dma_cmpltn_thread.nonempty_ctxq_bitmap, 0);
+	thread = kthread_run(ndma_h2d_cmpltn_thread_fn, nd, "neuron dma cmpltn");
+	if (IS_ERR(thread)) {
+		ret = PTR_ERR(thread);
+		pr_err("h2d dma completion thread creation failed\n");
+		goto out;
+	}
+	WRITE_ONCE(nd->dma_cmpltn_thread.thread, thread);
+
+out:
+	mutex_unlock(&nd->lock);
+	return ret;
+}
+
+void ndma_h2d_stop_cmpltn_thread(struct neuron_device *nd)
+{
+	if (!nd->dma_cmpltn_thread.thread) {
+		return;
+	}
+	if (IS_ERR(nd->dma_cmpltn_thread.thread)) {
+		nd->dma_cmpltn_thread.thread = NULL;
+		return;
+	}
+
+	nd->dma_cmpltn_thread.stop = true;
+	wake_up(&nd->dma_cmpltn_thread.wait_queue);
+	kthread_stop(nd->dma_cmpltn_thread.thread);
+	nd->dma_cmpltn_thread.thread = NULL;
+}
+
+/*
+ * Pre-pinned host memory implementation
+ * Uses a global hash table keyed by PID, with each process having its own
+ * rbtree of pinned memory regions keyed by VA.
+ * Host memory is not device-specific — a process can pin via any device
+ * and the zerocopy path on any device will find the pre-pinned region.
+ */
+
+/* 256 buckets: up to 16 devices × 16 processes per device */
+static DEFINE_HASHTABLE(pinned_mem_htable, 8);
+static DEFINE_MUTEX(pinned_mem_htable_lock); /* protects hash table add/remove/lookup only */
+
+/*
+ * Find or create per-process state and take a reference.
+ * Caller must hold pinned_mem_htable_lock; caller owns the returned ref.
+ */
+static struct neuron_pinned_mem_process *ndma_pinned_mem_get_process_locked(pid_t pid)
+{
+	struct neuron_pinned_mem_process *proc;
+
+	hash_for_each_possible(pinned_mem_htable, proc, hash_node, pid) {
+		if (proc->pid == pid) {
+			kref_get(&proc->refcount);
+			return proc;
+		}
+	}
+
+	proc = kzalloc(sizeof(*proc), GFP_KERNEL);
+	if (!proc)
+		return NULL;
+	proc->pid = pid;
+	proc->root = RB_ROOT;
+	mutex_init(&proc->lock);
+	kref_init(&proc->refcount); /* hash table holds initial ref */
+	hash_add(pinned_mem_htable, &proc->hash_node, pid);
+	kref_get(&proc->refcount);  /* caller's operational ref */
+	return proc;
+}
+
+/*
+ * Find per-process state and take a reference.
+ * Caller must hold pinned_mem_htable_lock; caller owns the returned ref.
+ * Returns NULL if not found (no ref taken).
+ */
+static struct neuron_pinned_mem_process *ndma_pinned_mem_find_process_locked(pid_t pid)
+{
+	struct neuron_pinned_mem_process *proc;
+
+	hash_for_each_possible(pinned_mem_htable, proc, hash_node, pid) {
+		if (proc->pid == pid) {
+			kref_get(&proc->refcount);
+			return proc;
+		}
+	}
+	return NULL;
+}
+
+static void ndma_pinned_mem_free_entry(struct neuron_pinned_mem *entry)
+{
+	if (entry->pages) {
+		unpin_user_pages(entry->pages, entry->nr_pages);
+		kvfree(entry->pages);
+	}
+	kfree(entry);
+}
+
+static void ndma_pinned_mem_destroy_tree(struct rb_root *root)
+{
+	struct rb_node *node;
+
+	while ((node = rb_first(root)) != NULL) {
+		struct neuron_pinned_mem *entry = rb_entry(node, struct neuron_pinned_mem, rb_node);
+		rb_erase(node, root);
+		ndma_pinned_mem_free_entry(entry);
+	}
+}
+
+void ndma_pinned_mem_destroy(void)
+{
+	struct neuron_pinned_mem_process *proc;
+	struct hlist_node *tmp;
+	int bkt;
+
+	mutex_lock(&pinned_mem_htable_lock);
+	hash_for_each_safe(pinned_mem_htable, bkt, tmp, proc, hash_node) {
+		hash_del(&proc->hash_node);
+		ndma_pinned_mem_destroy_tree(&proc->root);
+		kfree(proc);
+	}
+	mutex_unlock(&pinned_mem_htable_lock);
+}
+
+static void ndma_pinned_mem_process_release(struct kref *kref)
+{
+	struct neuron_pinned_mem_process *proc =
+		container_of(kref, struct neuron_pinned_mem_process, refcount);
+	mutex_lock(&proc->lock); // this is likely unnecessary because when we get here proc has been removed from the hash table
+	                         // on process exit and nobody can find this entry anymore 
+	ndma_pinned_mem_destroy_tree(&proc->root);
+	mutex_unlock(&proc->lock);
+	kfree(proc);
+}
+
+/* Find by exact VA match (for unpin) - caller must hold lock */
+static struct neuron_pinned_mem *ndma_pinned_mem_find_exact_locked(struct rb_root *root, u64 va)
+{
+	struct rb_node *node = root->rb_node;
+
+	while (node) {
+		struct neuron_pinned_mem *entry = rb_entry(node, struct neuron_pinned_mem, rb_node);
+
+		if (va < entry->va)
+			node = node->rb_left;
+		else if (va > entry->va)
+			node = node->rb_right;
+		else
+			return entry; /* exact match */
+	}
+	return NULL;
+}
+
+/* Find region containing VA range (for zerocopy) - caller must hold lock */
+static struct neuron_pinned_mem *ndma_pinned_mem_find_containing_locked(struct rb_root *root, u64 va, u64 size)
+{
+	struct rb_node *node = root->rb_node;
+	u64 va_end = va + size;
+
+	while (node) {
+		struct neuron_pinned_mem *entry = rb_entry(node, struct neuron_pinned_mem, rb_node);
+		u64 entry_end = entry->va + entry->size;
+
+		if (va_end <= entry->va) {
+			/* Range is entirely before this entry */
+			node = node->rb_left;
+		} else if (va >= entry_end) {
+			/* Range is entirely after this entry */
+			node = node->rb_right;
+		} else if (va >= entry->va && va_end <= entry_end) {
+			/* Range is fully contained within this entry */
+			return entry;
+		} else {
+			/* Partial overlap - not supported, return NULL */
+			return NULL;
+		}
+	}
+	return NULL;
+}
+
+/* Insert into rbtree - caller must hold lock */
+static int ndma_pinned_mem_insert_locked(struct rb_root *root, struct neuron_pinned_mem *new)
+{
+	struct rb_node **link = &root->rb_node;
+	struct rb_node *parent = NULL;
+	u64 new_end = new->va + new->size;
+
+	while (*link) {
+		struct neuron_pinned_mem *entry = rb_entry(*link, struct neuron_pinned_mem, rb_node);
+		u64 entry_end = entry->va + entry->size;
+
+		parent = *link;
+		if (new->va < entry->va) {
+			/* Check for overlap */
+			if (new_end > entry->va)
+				return -EEXIST; /* overlaps */
+			link = &(*link)->rb_left;
+		} else if (new->va > entry->va) {
+			/* Check for overlap */
+			if (new->va < entry_end)
+				return -EEXIST; /* overlaps */
+			link = &(*link)->rb_right;
+		} else {
+			return -EEXIST; /* exact duplicate */
+		}
+	}
+
+	rb_link_node(&new->rb_node, parent, link);
+	rb_insert_color(&new->rb_node, root);
+	return 0;
+}
+
+/**
+ * ndma_check_pages_contiguous() - Check if pinned pages are physically contiguous
+ * @pages: Array of pinned pages
+ * @nr_pages: Number of pages
+ * @offset: Byte offset within the first page
+ *
+ * Return: Physical address of the start of the region if all pages are
+ *         contiguous, or ~0ULL if they are not.
+ */
+static u64 ndma_check_pages_contiguous(struct page **pages, unsigned long nr_pages, unsigned long offset)
+{
+	unsigned long i;
+
+	for (i = 1; i < nr_pages; i++) {
+		if (page_to_phys(pages[i]) != page_to_phys(pages[i - 1]) + PAGE_SIZE)
+			return ~0ULL;
+	}
+	return (page_to_phys(pages[0]) + offset) | ndhal->ndhal_address_map.pci_host_base;
+}
+
+int ndma_pin_host_memory(u64 va, u64 size, u64 *pa_out)
+{
+	struct neuron_pinned_mem *entry;
+	struct neuron_pinned_mem_process *proc;
+	unsigned long offset = va & (PAGE_SIZE - 1);
+	unsigned long nr_pages = DIV_ROUND_UP(offset + size, PAGE_SIZE);
+	int ret;
+	long pinned;
+
+	if (va == 0 || size == 0)
+		return -EINVAL;
+
+	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+	if (!entry)
+		return -ENOMEM;
+
+	entry->pages = kvmalloc_array(nr_pages, sizeof(struct page *), GFP_KERNEL);
+	if (!entry->pages) {
+		ret = -ENOMEM;
+		goto err_free_entry;
+	}
+
+	/* Try fast path first - doesn't require mmap_lock */
+	pinned = pin_user_pages_fast(va & PAGE_MASK, nr_pages, FOLL_WRITE | FOLL_LONGTERM, entry->pages);
+	if (pinned < 0 || pinned < nr_pages) {
+		/* Fast path failed or incomplete - fall back to slow path */
+		if (pinned > 0)
+			unpin_user_pages(entry->pages, pinned);
+
+		/* Slow path with mmap_lock */
+		mmap_read_lock(current->mm);
+#if (!defined(RHEL_RELEASE_CODE) && (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0))) || (defined(RHEL_RELEASE_CODE) && (RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9, 6)))
+		pinned = pin_user_pages(va & PAGE_MASK, nr_pages, FOLL_WRITE | FOLL_LONGTERM, entry->pages);
+#else
+		pinned = pin_user_pages(va & PAGE_MASK, nr_pages, FOLL_WRITE | FOLL_LONGTERM, entry->pages, NULL);
+#endif
+		mmap_read_unlock(current->mm);
+
+		if (pinned < 0) {
+			pr_err("failed to pin pages: %ld\n", pinned);
+			ret = pinned;
+			goto err_free_pages;
+		}
+		if (pinned < nr_pages) {
+			pr_err("could not pin all pages: %ld/%lu\n", pinned, nr_pages);
+			unpin_user_pages(entry->pages, pinned);
+			ret = -EFAULT;
+			goto err_free_pages;
+		}
+	}
+
+	entry->va = va;
+	entry->size = size;
+	entry->nr_pages = nr_pages;
+	RB_CLEAR_NODE(&entry->rb_node);
+
+	mutex_lock(&pinned_mem_htable_lock);
+	proc = ndma_pinned_mem_get_process_locked(task_tgid_nr(current));
+	mutex_unlock(&pinned_mem_htable_lock);
+	if (!proc) {
+		ret = -ENOMEM;
+		goto err_unpin;
+	}
+	// here and elsewhere, slightly non-obvious.
+	// we ref counting proc to make sure it's not deleted in the 
+	// unlikely case the process is detached while we are here. Not 
+	// possible to happen in this function because it's called from IOCTL
+	// but a general pattern is to 1/ lock the hashtable 2/ return ref counted
+	// proc entry, 3/ operate on the entry and 4/ decrement the count
+	// this is specifically relevant for async zerocopy case getting pinned pages
+	// from proc because it's running as an independent thread.
+	mutex_lock(&proc->lock);
+	ret = ndma_pinned_mem_insert_locked(&proc->root, entry);
+	mutex_unlock(&proc->lock);
+	kref_put(&proc->refcount, ndma_pinned_mem_process_release);
+	if (ret) {
+		pr_err("Failed to register, likely due to app failure to unpin previous mmap()\n");
+		goto err_unpin;
+	}
+
+	/* Report contiguous PA if all pinned pages are physically adjacent. */
+	if (pa_out)
+		*pa_out = ndma_check_pages_contiguous(entry->pages, nr_pages, offset);
+
+	return 0;
+
+err_unpin:
+	unpin_user_pages(entry->pages, nr_pages);
+err_free_pages:
+	kvfree(entry->pages);
+err_free_entry:
+	kfree(entry);
+	return ret;
+}
+
+int ndma_unpin_host_memory(u64 va)
+{
+	struct neuron_pinned_mem *entry;
+	struct neuron_pinned_mem_process *proc;
+
+	mutex_lock(&pinned_mem_htable_lock);
+	proc = ndma_pinned_mem_find_process_locked(task_tgid_nr(current));
+	mutex_unlock(&pinned_mem_htable_lock);
+	if (!proc)
+		return -ENOENT;
+
+	mutex_lock(&proc->lock);
+	entry = ndma_pinned_mem_find_exact_locked(&proc->root, va);
+	if (!entry) {
+		mutex_unlock(&proc->lock);
+		kref_put(&proc->refcount, ndma_pinned_mem_process_release);
+		return -ENOENT;
+	}
+
+	rb_erase(&entry->rb_node, &proc->root);
+	mutex_unlock(&proc->lock);
+	kref_put(&proc->refcount, ndma_pinned_mem_process_release);
+
+	ndma_pinned_mem_free_entry(entry);
+	return 0;
+}
+
+/* Used by zero-copy API to use pinned pages instead on pinning on demand
+ * the copy can run either as part of IOCTL or in async thread, it takes PID
+ * of the process that pinned the pages.
+ */
+static bool ndma_pinned_mem_try_populate(pid_t pid, u64 va, u64 size, struct page **page_list, int nr_pages, struct neuron_pinned_mem_process **prepin_proc)
+{
+	struct neuron_pinned_mem_process *proc;
+	struct neuron_pinned_mem *entry;
+	bool found = false;
+
+	*prepin_proc = NULL;
+
+	mutex_lock(&pinned_mem_htable_lock);
+	proc = ndma_pinned_mem_find_process_locked(pid);
+	mutex_unlock(&pinned_mem_htable_lock);
+
+	if (proc) {
+		mutex_lock(&proc->lock);
+		entry = ndma_pinned_mem_find_containing_locked(&proc->root, va, size);
+		if (entry) {
+			unsigned long va_start = va & PAGE_MASK;
+			unsigned long pinned_va_start = entry->va & PAGE_MASK;
+			unsigned long page_offset = (va_start - pinned_va_start) >> PAGE_SHIFT;
+			int i;
+
+			for (i = 0; i < nr_pages; i++)
+				page_list[i] = entry->pages[page_offset + i];
+			found = true;
+		}
+		mutex_unlock(&proc->lock);
+		if (found) { 
+			*prepin_proc = proc;
+		} else { // we are holding a ref count for proc, but we did not find/copy any pages
+			     // so we don't need to hold on to the proc
+			kref_put(&proc->refcount, ndma_pinned_mem_process_release);
+		}
+	}
+
+	return found;
+}
+
+void ndma_pinned_mem_cleanup_process(pid_t pid)
+{
+	struct neuron_pinned_mem_process *proc;
+
+	mutex_lock(&pinned_mem_htable_lock);
+	proc = ndma_pinned_mem_find_process_locked(pid);
+	if (proc)
+		hash_del(&proc->hash_node); /* prevent new lookups */
+	mutex_unlock(&pinned_mem_htable_lock);
+
+	if (proc) {
+		/* Drop the find ref; the hash_del above means no new refs can be taken */
+		kref_put(&proc->refcount, ndma_pinned_mem_process_release);
+		/* Drop the hash table's initial ref — frees proc when last user is done, when ref count is 0 rb tree is deleted and everything is unpinned */
+		kref_put(&proc->refcount, ndma_pinned_mem_process_release);
+	}
 }
