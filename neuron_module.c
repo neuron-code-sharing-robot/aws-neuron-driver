@@ -17,14 +17,16 @@
 #include "neuron_trace.h"
 #include "neuron_cdev.h"
 #include "neuron_pci.h"
+#include "neuron_dma.h"
+#include "neuron_test.h"
 
-MODULE_DESCRIPTION("Neuron Driver, built from SHA: 1c7ed9bd14936635773b5a01777882804ee8ea6e");
+MODULE_DESCRIPTION("Neuron Driver, built from SHA: 38e99b1fb8df603ee4109868c6d949e30f2c32c8");
 MODULE_LICENSE("GPL");
-MODULE_VERSION("2.27.4.0");
+MODULE_VERSION("2.28.0.0");
 MODULE_ALIAS("pci:v00001d0fd00007064sv*sd*bc*sc*i*");
 
-const char driver_version[] = "2.27.4.0";
-const char driver_revision[] = "1c7ed9bd14936635773b5a01777882804ee8ea6e";
+const char driver_version[] = "2.28.0.0";
+const char driver_revision[] = "38e99b1fb8df603ee4109868c6d949e30f2c32c8";
 
 #ifdef CONFIG_FAULT_INJECTION
 
@@ -75,6 +77,7 @@ static int __init neuron_module_init(void)
 #ifdef CONFIG_FAULT_INJECTION
 	neuron_module_init_debugfs();
 #endif
+	ntest_init();
 
 	ret = ncdev_module_init();
 	if (ret)
@@ -92,6 +95,7 @@ static void __exit neuron_module_exit(void)
 #ifdef CONFIG_FAULT_INJECTION
 	neuron_module_free_debugfs();
 #endif
+	ndma_pinned_mem_destroy();
 	neuron_pci_module_exit();
 	ncdev_module_exit();
 }

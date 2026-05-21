@@ -8,7 +8,9 @@
 
 #include <linux/capability.h>
 #include <linux/fault-inject.h>
+#include <linux/mman.h>
 #include "neuron_mmap.h"
+#include "neuron_p2p.h"
 #include "neuron_pci.h"
 #include "neuron_device.h"
 #include "neuron_dhal.h"
@@ -279,8 +281,10 @@ static struct mem_chunk *nmmap_get_mc(struct neuron_device *nd, struct vm_area_s
 	 * memchunk boundaries.
 	*/
 	if (mc->size != size && mc->alloc_type != NEURON_MEMALLOC_TYPE_CONTIGUOUS_SCRATCHPAD_DEVICE) {
-		pr_err("nd%d: partial mmap of mc not supported(%llx != %llx)\n", nd->device_index,
-		       mc->size, size);
+		if (nmap_dm_special_resource_addr_valid(offset, size, NULL, NULL, NULL)) {
+			pr_err("nd%d: partial mmap of mc not supported(%llx != %llx)\n", nd->device_index,
+					mc->size, size);
+		}
 		return NULL;
 	} else if (mc->alloc_type == NEURON_MEMALLOC_TYPE_CONTIGUOUS_SCRATCHPAD_DEVICE) {
 		if (mc->pa + size > mc->mp->main_pool_end_addr) {
@@ -308,6 +312,7 @@ static const struct vm_operations_struct nmmap_dm_vm_ops = {
 
 static int nmmap_dm(struct neuron_device *nd, struct vm_area_struct *vma, u64 *bar4_offset)
 {
+	int ret;
 	u64 start, size, offset;
 
 	if (!nd->npdev.bar4_pa) {
@@ -317,7 +322,11 @@ static int nmmap_dm(struct neuron_device *nd, struct vm_area_struct *vma, u64 *b
 
 	start = vma->vm_pgoff << PAGE_SHIFT;
 	size = vma->vm_end - vma->vm_start;
-	ndhal->ndhal_mmap.mmap_get_bar4_offset(start, size, &offset);
+	ret = ndhal->ndhal_mmap.mmap_get_bar4_offset(start, size, &offset);
+	if (unlikely(ret)) {
+		pr_err("Failed to map address 0x%llx to BAR4\n", start);
+		return ret;
+	}
 
 	if (bar4_offset)
 		*bar4_offset = offset;
@@ -509,4 +518,28 @@ int nmmap_get_va_placement(void *va, int *device_index, int *hbm_index)
 	return -ENXIO;
 }
 
+/**
+ * nmmap_get_unmapped_area() - Return a huge page aligned VA for device mmaps whose
+ * offset and size are both huge page aligned.
+ */
+unsigned long nmmap_get_unmapped_area(struct file *filep, unsigned long addr,
+				      unsigned long len, unsigned long pgoff,
+				      unsigned long flags)
+{
+	unsigned long offset = pgoff << PAGE_SHIFT;
+	unsigned long aligned;
 
+	if ((flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) ||
+	    (!IS_ALIGNED(offset, NEURON_P2P_HUGE_PAGE_SZ)) ||
+	    (!IS_ALIGNED(len, NEURON_P2P_HUGE_PAGE_SZ)) ||
+	    (len == 0 || len > ULONG_MAX - NEURON_P2P_HUGE_PAGE_SZ)) {
+		return nmmap_kern_get_unmapped_area(filep, addr, len, pgoff, flags);
+	}
+
+	aligned = nmmap_kern_get_unmapped_area(filep, addr, len + NEURON_P2P_HUGE_PAGE_SZ, pgoff, flags);
+	if (IS_ERR_VALUE(aligned)) {
+		return nmmap_kern_get_unmapped_area(filep, addr, len, pgoff, flags);
+	}
+
+	return ALIGN(aligned, NEURON_P2P_HUGE_PAGE_SZ);
+}

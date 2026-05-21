@@ -33,8 +33,8 @@ TRACE_EVENT(dma_engine_init,
 TRACE_EVENT(dma_queue_init,
 	TP_PROTO(struct neuron_device *nd, u32 eng_id, u32 qid, u32 tx_desc_count,
 		 u32 rx_desc_count, struct mem_chunk *tx_mc,
-		 struct mem_chunk *rx_mc, struct mem_chunk *rxc_mc, u32 port),
-	TP_ARGS(nd, eng_id, qid, tx_desc_count, rx_desc_count, tx_mc, rx_mc, rxc_mc, port),
+		 struct mem_chunk *rx_mc, struct mem_chunk *rxc_mc),
+	TP_ARGS(nd, eng_id, qid, tx_desc_count, rx_desc_count, tx_mc, rx_mc, rxc_mc),
 	TP_STRUCT__entry(
 		__field(u32,	        device_index)
 		__field(u32,	        eng_id)
@@ -44,7 +44,6 @@ TRACE_EVENT(dma_queue_init,
 		__field(struct mem_chunk *,	        tx_mc)
 		__field(struct mem_chunk *,	        rx_mc)
 		__field(struct mem_chunk *,	        rxc_mc)
-		__field(u32,	        port)
 		),
 	TP_fast_assign(
 		__entry->device_index = nd->device_index;
@@ -55,9 +54,8 @@ TRACE_EVENT(dma_queue_init,
 		__entry->tx_mc = tx_mc;
 		__entry->rx_mc = rx_mc;
 		__entry->rxc_mc = rxc_mc;
-		__entry->port = port;
 	),
-	TP_printk("nd%d eng%d q%d tx_count %d rx_count %d tx %llx rx %llx rxc %llx port %d",
+	TP_printk("nd%d eng%d q%d tx_count %d rx_count %d tx %llx rx %llx rxc %llx",
 		__entry->device_index,
 		__entry->eng_id,
 		__entry->qid,
@@ -65,8 +63,7 @@ TRACE_EVENT(dma_queue_init,
 		__entry->rx_desc_count,
 		__entry->rx_mc->pa,
 		__entry->tx_mc->pa,
-		__entry->rxc_mc == NULL ? 0 : __entry->rxc_mc->pa,
-		__entry->port
+		__entry->rxc_mc == NULL ? 0 : __entry->rxc_mc->pa
 	));
 
 TRACE_EVENT(dma_queue_release,

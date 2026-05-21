@@ -26,6 +26,7 @@ enum nsysfsmetric_attr_type {
     PRESENT,   // counter value at the current window
     PEAK,      // max counter value
     OTHER,     // all other types besides TOTAL, PRESENT, and PEAK
+    CACHED_VALUES, // cached value updated out-of-band (e.g., by a polling thread)
 };
 
 enum nsysfsmetric_metric_id_category {
@@ -73,6 +74,10 @@ enum nsysfsmetric_non_nds_ids { // The metrics needed by sysfs metrics but not s
 	NON_NDS_OTHER_NOTIFY_DELAY,
 	NON_NDS_OTHER_SERIAL_NUMBER,
 	NON_NDS_OTHER_POWER_UTILIZATION,
+	NON_NDS_HEALTH_STATUS_SRAM_UE_COUNT,
+	NON_NDS_HEALTH_STATUS_HBM_UE_COUNT,
+	NON_NDS_HEALTH_STATUS_REPAIRABLE_HBM_UE_COUNT,
+	NON_NDS_HEALTH_STATUS_HW_ERROR_EVENT,
 };
 
 struct neuron_device;
@@ -81,6 +86,19 @@ struct sysfs_mem_thread {
 	struct task_struct *thread; // aggregation thread that sends metrics every 1 second
 	wait_queue_head_t wait_queue;
 	volatile bool stop; // if cleared, thread would exit the loop
+};
+
+// Cache slot identifiers for misc RAM registers whose values are exposed under
+// stats/hardware/health_status/. Add a new value here when caching a new register.
+enum health_status_cache_slot {
+	HEALTH_STATUS_SLOT_SRAM_ECC,
+	HEALTH_STATUS_SLOT_HBM0_ECC,
+	HEALTH_STATUS_SLOT_HBM1_ECC,
+	HEALTH_STATUS_SLOT_HBM2_ECC,
+	HEALTH_STATUS_SLOT_HBM3_ECC,
+	HEALTH_STATUS_SLOT_HBM_REPAIR_STATE,
+	HEALTH_STATUS_SLOT_FW_API_VERSION,
+	HEALTH_STATUS_SLOT_COUNT,
 };
 
 struct nsysfsmetric_counter {
@@ -107,6 +125,14 @@ struct nsysfsmetric_metrics { // per neuron_device
     // nc_id should be -1 to use nrt_nd_metrics, and should be a valid neuron core ID to use nrt_metrics
     struct nsysfsmetric_counter dev_metrics[MAX_METRIC_ID]; // TODO: the device metrics
     uint64_t bitmap; // store the dynamic metrics to be added
+
+    // Cached misc RAM register values for stats/hardware/health_status/.
+    // Updated periodically from the metrics thread; sysfs reads return cached values.
+    // Indexed by enum health_status_cache_slot.
+    u32 cached_health_regs[HEALTH_STATUS_SLOT_COUNT];
+    u32 hw_error_event_count;
+    struct nsysfsmetric_node *hardware_node;     // stats/hardware/; cached so health_status can attach under it
+    struct nsysfsmetric_node *health_status_node; // target for sysfs_notify on hw_error_event
 };
 
 typedef struct nsysfsmetric_attr_info {
@@ -220,5 +246,14 @@ void nsysfsmetric_set_counter(struct neuron_device *nd, int metric_id_category, 
  */
 void nsysfsmetric_inc_reset_fail_count(struct neuron_device *nd);
 
+/**
+ * nsysfsmetric_add_health_status_nodes() - add stats/hardware/health_status/ subtree under the hardware node
+ */
+int nsysfsmetric_add_health_status_nodes(struct nsysfsmetric_metrics *metrics, struct nsysfsmetric_node *hardware_node);
+
+/**
+ * nsysfsmetric_health_status_tick() - perform a single health_status cache refresh; invoked from the metrics thread
+ */
+void nsysfsmetric_health_status_tick(struct neuron_device *nd);
 
 #endif

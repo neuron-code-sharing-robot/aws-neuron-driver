@@ -26,6 +26,7 @@ struct ndhal_arch {
     int arch;
     enum neuron_platform_type platform_type;
     u32 server_id;
+    int (*narch_platform_ready) (struct neuron_device *nd, enum neuron_platform_operation_type platform_operation);
 };
 struct ndhal_address_map {
 	// addresses
@@ -36,7 +37,6 @@ struct ndhal_address_map {
 	uint64_t mmap_nc_sema_incr_offset;
 	uint64_t mmap_nc_sema_decr_offset;
 	uint64_t bar0_misc_ram_offset;
-	uint64_t port_1_base;
 
 	// counts
 	int nc_per_device;
@@ -90,6 +90,8 @@ struct ndhal_mpset {
 struct ndhal_ndmar {
     uint32_t (*ndmar_get_h2t_eng_id) (struct neuron_device *nd, uint32_t nc_id);
     int (*ndmar_get_h2t_def_qid) (uint32_t nc_id);
+    int (*ndmar_ctx_queue_bit) (uint32_t h2d_eng_id, uint32_t qid);
+    void (*ndmar_ctx_queue_from_bit) (int bit, uint32_t *h2d_eng_id, uint32_t *qid);
     bool (*ndmar_is_h2t_def_q) (struct neuron_device *nd, uint32_t eng_id, uint32_t q_id);
     bool (*nr_init_h2t_eng) ( int nc_idx, uint32_t nc_map); 
     bool (*ndmar_is_nx_ring) (uint32_t eng_id, uint32_t q_id);
@@ -97,6 +99,7 @@ struct ndhal_ndmar {
 };
 
 struct ndhal_fw_io {
+    u32 new_readless_read_min_api_version;
     int (*fw_io_topology) (struct fw_io_ctx *ctx, int pdev_index, int device_id, u32 *connected_device_ids, int *count);
     int (*fw_io_register_readless_read_region) (struct fw_io_ctx *ctx, void __iomem *bar0, u64 bar0_size, void __iomem *bar2, u64 bar2_size);
     int (*fw_io_read_csr_array) (void **addrs, u32 *values, u32 num_csrs, bool operational);
@@ -131,6 +134,8 @@ struct ndhal_sysfs_metrics {
                                                 int nc_id,
                                                 int tensor_engine_attrs_info_tbl_cnt,
                                                 const nsysfsmetric_attr_info_t *tensor_engine_attr_info_tbl);
+
+    bool health_status_enabled;
 };
 
 struct ndhal_pci {

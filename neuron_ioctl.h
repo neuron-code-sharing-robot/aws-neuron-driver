@@ -61,6 +61,24 @@ struct neuron_ioctl_mem_alloc_v2_mem_type64 {
 	__u32 pad;  // [dummy] used to descriminate between ioctl version
 };
 
+/*
+ * Extension of neuron_ioctl_mem_alloc_v2_mem_type64 that also returns PA.
+ * The driver detects this variant by its larger _IOC_SIZE, saving a
+ * separate NEURON_IOCTL_MEM_GET_PA ioctl call.
+ */
+struct neuron_ioctl_mem_alloc_v2_mem_type64_pa {
+	__u64 size; // [in] Allocation size
+	__u64 align; // [in] alignment
+	__u32 host_memory; // [in] If true allocates from host memory; else allocates from device memory
+	__u32 dram_channel; // [in] DRAM channel in device memory
+	__u32 dram_region; // [in] DRAM region in device memory
+	__u32 nc_id; // [in] NeuronCore id(valid only if location is device)
+	__u32 mem_type; // [in] type of allocation
+	__u64 *mem_handle; // [out] Allocated memory handle would stored here.
+	__u32 pad;  // [dummy] used to descriminate between ioctl version
+	__u64 pa;   // [out] Physical address of the allocated memory
+};
+
 struct neuron_ioctl_device_init {
 	/* Splits DRAM in the device into smaller regions.
 	 * This improves performance of DDR by allowing parallel DMA using different regions.
@@ -265,7 +283,7 @@ struct neuron_ioctl_dma_queue_init {
 	__u64 tx_handle; // [in] mem handle for the tx ring
 	__u64 rx_handle; // [in] mem handle for the rx ring
 	__u64 rxc_handle; // [in] mem handle for the rxc ring
-	__u32 axi_port; // [in] axi port
+	__u32 axi_port_unused; // unused
 };
 
 #define MAX_DMA_QUEUE_INIT_BATCH 256
@@ -550,7 +568,7 @@ struct neuron_ioctl_host_device_id_to_rid_map {
 struct neuron_ioctl_hbm_scrub_start {
 	__u32 nc_id;
 	__u32 hbm_index;
-	__u32 axi_port;
+	__u32 axi_port_unused;
 	__u32 init_val;
 };
 
@@ -652,6 +670,20 @@ struct neuron_ioctl_get_async_h2t_dma_compl_queues {
 	} compl_queue_info[16];
 };
 
+/**
+ * Pre-pinned host memory support
+ * Allows pinning host memory once and reusing for multiple DMA transfers.
+ * Uses VA as the lookup key - no handles exposed to userspace.
+ */
+struct neuron_ioctl_host_mem_pin {
+	__u64 va;			// [in] User virtual address to pin
+	__u64 size;			// [in] Size of memory to pin
+	__u64 pa;			// [out] Physical address if contiguous, ~0ULL if not
+};
+
+struct neuron_ioctl_host_mem_unpin {
+	__u64 va;			// [in] VA to unpin (must match exact VA from pin)
+};
 
 #define NEURON_IOCTL_BASE 'N'
 
@@ -785,6 +817,7 @@ struct neuron_ioctl_get_async_h2t_dma_compl_queues {
 #define NEURON_IOCTL_MEM_ALLOC_V2 _IOR(NEURON_IOCTL_BASE, 102, struct neuron_ioctl_mem_alloc_v2 *) // V2 here refers to neuron 2.x, not arch type
 #define NEURON_IOCTL_MEM_ALLOC_V2MT _IOR(NEURON_IOCTL_BASE, 102, struct neuron_ioctl_mem_alloc_v2_mem_type) // just V2 with additional field mem_type
 #define NEURON_IOCTL_MEM_ALLOC_V2MT64 _IOR(NEURON_IOCTL_BASE, 102, struct neuron_ioctl_mem_alloc_v2_mem_type64) // V2 + mem_type + pad
+#define NEURON_IOCTL_MEM_ALLOC_V2MT64_PA _IOWR(NEURON_IOCTL_BASE, 102, struct neuron_ioctl_mem_alloc_v2_mem_type64_pa) // V2MT64 + pa output
 
 /** Resets the requested NC (-1 for full device) */
 #define NEURON_IOCTL_NC_RESET _IOR(NEURON_IOCTL_BASE, 103, struct neuron_ioctl_device_reset *)
@@ -872,5 +905,9 @@ struct neuron_ioctl_get_async_h2t_dma_compl_queues {
 #define NEURON_IOCTL_AVAILABLE_PERF_PROFILES _IOWR(NEURON_IOCTL_BASE, 134, struct neuron_ioctl_available_perf_profiles)
 
 #define NEURON_IOCTL_GET_ASYNC_H2T_DMA_COMPL_QUEUES _IOWR(NEURON_IOCTL_BASE, 135, struct neuron_ioctl_get_async_h2t_dma_compl_queues)
+
+/** Pre-pinned host memory operations - zerocopy will auto-detect pinned memory */
+#define NEURON_IOCTL_HOST_MEM_PIN _IOWR(NEURON_IOCTL_BASE, 136, struct neuron_ioctl_host_mem_pin)
+#define NEURON_IOCTL_HOST_MEM_UNPIN _IOW(NEURON_IOCTL_BASE, 137, struct neuron_ioctl_host_mem_unpin)
 
 #endif

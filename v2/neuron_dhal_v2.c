@@ -114,6 +114,18 @@ static int ndhal_register_funcs_inf2(void) {
 }
 
 
+/* Device Arch Functions */
+/**
+ * narch_platform_ready() - return platform ready status
+ *   Certain platforms operations require the platform to be in particular state
+ *
+ */
+static int narch_platform_ready_v2(struct neuron_device *nd,  enum neuron_platform_operation_type platform_operation)
+{
+	return 0;
+}
+
+
 /* Device Reset Functions */
 static void nr_get_tpb_reset_map(uint32_t nc_map, uint32_t *tpb_reset_map)
 {
@@ -492,6 +504,32 @@ static int ndmar_get_h2t_def_qid_v2(uint32_t nc_id)
 	return 0;
 }
 
+/**
+ * ndmar_ctx_queue_bit_v2() - dummy ctx queue bitmap mapping for v2
+ * @h2d_eng_id: ignored
+ * @qid: ignored
+ *
+ * Async IO is not supported on v2, so this hook is unused.
+ */
+static int ndmar_ctx_queue_bit_v2(uint32_t h2d_eng_id, uint32_t qid)
+{
+	return 0;
+}
+
+/**
+ * ndmar_ctx_queue_from_bit_v2() - dummy ctx queue bitmap reverse mapping for v2
+ * @bit: ignored
+ * @h2d_eng_id: returned DMA engine id placeholder
+ * @qid: returned DMA queue id placeholder
+ *
+ * Async IO is not supported on v2, so this hook is unused.
+ */
+static void ndmar_ctx_queue_from_bit_v2(int bit, uint32_t *h2d_eng_id, uint32_t *qid)
+{
+	*h2d_eng_id = 0;
+	*qid = 0;
+}
+
 /** 
  * ndmar_is_h2t_def_q() - return true 
  *
@@ -751,9 +789,9 @@ static int fw_io_post_metric_v2(struct fw_io_ctx *ctx, u8 *data, u32 size)
  */
 static int mmap_get_bar4_offset_v2(u64 start_addr, u64 size, u64 *offset)
 {
-	if (start_addr >= V2_HBM_0_BASE && start_addr + size < V2_HBM_0_BASE + V2_HBM_0_SIZE)
+	if (start_addr >= V2_HBM_0_BASE && start_addr + size <= V2_HBM_0_BASE + V2_HBM_0_SIZE)
 		*offset = start_addr;
-	else if (start_addr >= V2_HBM_1_BASE && start_addr + size < V2_HBM_1_BASE + V2_HBM_1_SIZE)
+	else if (start_addr >= V2_HBM_1_BASE && start_addr + size <= V2_HBM_1_BASE + V2_HBM_1_SIZE)
 		// The 64GB - 80GB range is mapped to 16GB - 32GB on bar4
 		*offset = start_addr - V2_HBM_1_BASE + V2_HBM_0_SIZE;
 	else
@@ -1382,6 +1420,7 @@ int ndhal_register_funcs_v2(void) {
 		return -EINVAL;
 	}
 
+	ndhal->ndhal_arch.narch_platform_ready = narch_platform_ready_v2;
 	ndhal->ndhal_address_map.pci_host_base = V2_PCIE_A0_BASE;
 	ndhal->ndhal_address_map.mmap_nc_event_offset = V2_MMAP_NC_EVENT_OFFSET;
 	ndhal->ndhal_address_map.mmap_nc_sema_read_offset = V2_MMAP_NC_SEMA_READ_OFFSET;
@@ -1389,7 +1428,6 @@ int ndhal_register_funcs_v2(void) {
 	ndhal->ndhal_address_map.mmap_nc_sema_incr_offset = V2_MMAP_NC_SEMA_INCR_OFFSET;
 	ndhal->ndhal_address_map.mmap_nc_sema_decr_offset = V2_MMAP_NC_SEMA_DECR_OFFSET;
 	ndhal->ndhal_address_map.bar0_misc_ram_offset = V2_MMAP_BAR0_APB_MISC_RAM_OFFSET;
-	ndhal->ndhal_address_map.port_1_base = 0ull;
 	ndhal->ndhal_address_map.nc_per_device = V2_NC_PER_DEVICE;
 	ndhal->ndhal_address_map.dev_nc_map = (1 << V2_NC_PER_DEVICE) - 1;
 	ndhal->ndhal_address_map.dice_per_device = V2_NUM_DIE_PER_DEVICE;
@@ -1414,10 +1452,13 @@ int ndhal_register_funcs_v2(void) {
 	ndhal->ndhal_mpset.mpset_set_dram_and_mpset_info = mpset_set_dram_and_mpset_info_v2;
 	ndhal->ndhal_ndmar.ndmar_get_h2t_eng_id = ndmar_get_h2t_eng_id_v2;
     ndhal->ndhal_ndmar.ndmar_get_h2t_def_qid = ndmar_get_h2t_def_qid_v2;
+	ndhal->ndhal_ndmar.ndmar_ctx_queue_bit = ndmar_ctx_queue_bit_v2;
+	ndhal->ndhal_ndmar.ndmar_ctx_queue_from_bit = ndmar_ctx_queue_from_bit_v2;
     ndhal->ndhal_ndmar.ndmar_is_h2t_def_q = ndmar_is_h2t_def_q_v2;
 	ndhal->ndhal_ndmar.nr_init_h2t_eng = nr_init_h2t_eng_v2;
 	ndhal->ndhal_ndmar.ndmar_is_nx_ring = ndmar_is_nx_ring_v2;
 	ndhal->ndhal_ndmar.ndmar_quiesce_queues = ndmar_quiesce_queues_v2;
+	ndhal->ndhal_fw_io.new_readless_read_min_api_version = U32_MAX;
 	ndhal->ndhal_fw_io.fw_io_topology = fw_io_topology_v2;
 	ndhal->ndhal_fw_io.fw_io_register_readless_read_region = fw_io_register_readless_read_region_v2;
 	ndhal->ndhal_fw_io.fw_io_read_csr_array = fw_io_read_csr_array_v2;

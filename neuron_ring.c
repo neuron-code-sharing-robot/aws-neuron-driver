@@ -85,11 +85,9 @@ u32 ndmar_ring_get_desc_count(u32 v)
  * @eng: dma engine
  * @qid: dma queue id in the engine for which the mc is being set.
  * @mc: backing memory chunk
- * @port: which axi port(0 or 1) to access the DRAM(for performance)
  * @queue_type: type of the queue(rx, tx, or completion)
  */
-static void ndmar_ring_set_mem_chunk(struct ndma_eng *eng, u32 qid, struct mem_chunk *mc, u32 port,
-				     enum neuron_dma_queue_type queue_type)
+static void ndmar_ring_set_mem_chunk(struct ndma_eng *eng, u32 qid, struct mem_chunk *mc, enum neuron_dma_queue_type queue_type)
 {
 	struct ndma_queue *queue = ndmar_get_queue(eng, qid);
 	struct ndma_ring *ring = ndmar_get_ring(queue);
@@ -102,9 +100,6 @@ static void ndmar_ring_set_mem_chunk(struct ndma_eng *eng, u32 qid, struct mem_c
 			ring->tx.addr = virt_to_phys(ring->tx.ptr) | ndhal->ndhal_address_map.pci_host_base;
 		} else {
 			ring->tx.addr = mc->pa;
-			if (port) {
-				ring->tx.addr |= ndhal->ndhal_address_map.port_1_base;
-			}
 		}
 		break;
 	case NEURON_DMA_QUEUE_TYPE_RX:
@@ -114,9 +109,6 @@ static void ndmar_ring_set_mem_chunk(struct ndma_eng *eng, u32 qid, struct mem_c
 			ring->rx.addr = virt_to_phys(ring->rx.ptr) | ndhal->ndhal_address_map.pci_host_base;
 		} else {
 			ring->rx.addr = mc->pa;
-			if (port) {
-				ring->rx.addr |= ndhal->ndhal_address_map.port_1_base;
-			}
 		}
 		break;
 	case NEURON_DMA_QUEUE_TYPE_COMPLETION:
@@ -127,9 +119,6 @@ static void ndmar_ring_set_mem_chunk(struct ndma_eng *eng, u32 qid, struct mem_c
 			ring->rxc.addr = virt_to_phys(ring->rxc.ptr) | ndhal->ndhal_address_map.pci_host_base;
 		} else {
 			ring->rxc.addr = mc->pa;
-			if (port) {
-				ring->rxc.addr |= ndhal->ndhal_address_map.port_1_base;
-			}
 		}
 		break;
 	default:
@@ -139,7 +128,7 @@ static void ndmar_ring_set_mem_chunk(struct ndma_eng *eng, u32 qid, struct mem_c
 
 int ndmar_queue_init(struct neuron_device *nd, u32 eng_id, u32 qid, u32 tx_desc_count,
 		     u32 rx_desc_count, struct mem_chunk *tx_mc, struct mem_chunk *rx_mc,
-		     struct mem_chunk *rxc_mc, u32 port, bool allocatable)
+		     struct mem_chunk *rxc_mc, bool allocatable)
 {
 	int ret = -1;
 	struct ndma_eng *eng;
@@ -171,8 +160,7 @@ int ndmar_queue_init(struct neuron_device *nd, u32 eng_id, u32 qid, u32 tx_desc_
 	ring->qid = qid;
 	ring->h2t_completion_mc = NULL;
 
-	trace_dma_queue_init(nd, eng_id, qid, tx_desc_count, rx_desc_count, tx_mc, rx_mc, rxc_mc,
-			     port);
+	trace_dma_queue_init(nd, eng_id, qid, tx_desc_count, rx_desc_count, tx_mc, rx_mc, rxc_mc);
 
 	if (tx_mc) {
 		/*
@@ -180,7 +168,7 @@ int ndmar_queue_init(struct neuron_device *nd, u32 eng_id, u32 qid, u32 tx_desc_
 			ret = -EINVAL;
 			goto done;
 		}*/
-		ndmar_ring_set_mem_chunk(eng, qid, tx_mc, port, NEURON_DMA_QUEUE_TYPE_TX);
+		ndmar_ring_set_mem_chunk(eng, qid, tx_mc, NEURON_DMA_QUEUE_TYPE_TX);
 	}
 
 	if (rx_mc) {
@@ -189,7 +177,7 @@ int ndmar_queue_init(struct neuron_device *nd, u32 eng_id, u32 qid, u32 tx_desc_
 			ret = -EINVAL;
 			goto done;
 		}*/
-		ndmar_ring_set_mem_chunk(eng, qid, rx_mc, port, NEURON_DMA_QUEUE_TYPE_RX);
+		ndmar_ring_set_mem_chunk(eng, qid, rx_mc, NEURON_DMA_QUEUE_TYPE_RX);
 	}
 
 	if (rxc_mc) {
@@ -197,7 +185,7 @@ int ndmar_queue_init(struct neuron_device *nd, u32 eng_id, u32 qid, u32 tx_desc_
 			ret = -EINVAL;
 			goto done;
 		}
-		ndmar_ring_set_mem_chunk(eng, qid, rxc_mc, port, NEURON_DMA_QUEUE_TYPE_COMPLETION);
+		ndmar_ring_set_mem_chunk(eng, qid, rxc_mc, NEURON_DMA_QUEUE_TYPE_COMPLETION);
 	}
 
 	ret = udma_m2m_init_queue(&eng->udma, qid, eng_id, tx_desc_count, rx_desc_count, allocatable, tx_mc != NULL ? &ring->tx : NULL,
@@ -261,7 +249,7 @@ void ndmar_handle_process_exit(struct neuron_device *nd, pid_t pid)
 				continue;
 			}
 
-			ret = ndmar_queue_init(nd, eng_id, qid, desc_count, desc_count, mc, mc, NULL, 0, false);
+			ret = ndmar_queue_init(nd, eng_id, qid, desc_count, desc_count, mc, mc, NULL, false);
 			// ignore the error and continue to reset other queues.
 			if (ret)
 				pr_err("nd%d:dma%d:q%d failed to reset (%d)", nd->device_index, eng_id, qid, ret);
@@ -380,8 +368,8 @@ static int ndmar_h2t_ring_alloc(struct neuron_device *nd, int nc_id, int qid)
 		goto error;
 	}
 
-	ndmar_ring_set_mem_chunk(eng, qid, tx_mc, 0, NEURON_DMA_QUEUE_TYPE_TX);
-	ndmar_ring_set_mem_chunk(eng, qid, rx_mc, 0, NEURON_DMA_QUEUE_TYPE_RX);
+	ndmar_ring_set_mem_chunk(eng, qid, tx_mc, NEURON_DMA_QUEUE_TYPE_TX);
+	ndmar_ring_set_mem_chunk(eng, qid, rx_mc, NEURON_DMA_QUEUE_TYPE_RX);
 
 	ret = mc_alloc_align(nd, MC_LIFESPAN_DEVICE, sizeof(u32) * 2 * NEURON_DMA_H2T_CTX_HANDLE_CNT, 0, MEM_LOC_HOST, 0, 0, nc_id, NEURON_MEMALLOC_TYPE_NCDEV_HOST, &h2t_completion_mc);
 	if (ret) {

@@ -18,6 +18,18 @@
 #define RHEL_RELEASE_VERSION(a,b) 1
 #endif
 
+/*
+ * Linux 6.10 removed get_unmapped_area from mm_struct and replaced it
+ * with the standalone mm_get_unmapped_area() function.
+ */
+#if (!defined(RHEL_RELEASE_CODE) && (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 10, 0))) || (defined(RHEL_RELEASE_CODE) && (RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9, 5)))
+#define nmmap_kern_get_unmapped_area(filep, addr, len, pgoff, flags) \
+	mm_get_unmapped_area(current->mm, filep, addr, len, pgoff, flags)
+#else
+#define nmmap_kern_get_unmapped_area(filep, addr, len, pgoff, flags) \
+	current->mm->get_unmapped_area(filep, addr, len, pgoff, flags)
+#endif
+
 #if (!defined(RHEL_RELEASE_CODE) && (LINUX_VERSION_CODE < KERNEL_VERSION(6, 3, 0))) || (defined(RHEL_RELEASE_CODE) && (RHEL_RELEASE_CODE < RHEL_RELEASE_VERSION(9, 5)))
 static inline void vm_flags_set(struct vm_area_struct *vma, vm_flags_t flags)
 {
@@ -148,4 +160,21 @@ struct mem_chunk *nmmap_get_mc_from_pa(struct neuron_device *nd, phys_addr_t pa)
  */
 
 int nmmap_get_va_placement(void *va, int *device_index, int *hbm_index);
+
+/**
+ * nmmap_get_unmapped_area() - Return a huge page aligned VA for device mmaps
+ *  whose offset and size are both huge page aligned. This enables EFA P2P MR
+ *  registration to use 2MB pages instead of 4KB pages.
+ *
+ * @filep:	file pointer
+ * @addr:	address hint from userspace
+ * @len:	mapping length
+ * @pgoff:	page offset (device BAR offset)
+ * @flags:	mmap flags
+ *
+ * Return: unmapped area address, or error value
+ */
+unsigned long nmmap_get_unmapped_area(struct file *filep, unsigned long addr,
+				      unsigned long len, unsigned long pgoff,
+				      unsigned long flags);
 #endif

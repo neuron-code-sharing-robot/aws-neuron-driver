@@ -71,6 +71,7 @@ struct neuron_device {
 	struct pci_dev *pdev;
 	int device_index;
 	volatile enum neuron_device_state device_state; // current state of this device
+	struct mutex lock; // serialize neuron_device access when device-wide exclusion is needed
 
 	// all the processes that are opened this device
 	struct neuron_attached_process attached_processes[NEURON_MAX_PROCESS_PER_DEVICE];
@@ -126,6 +127,9 @@ struct neuron_device {
 	// volatile to prevent compiler optimizations since accessed by different threads
 	// This is the true value per-device, instead of the global one in ndhal_perf used only for metrics
 	volatile int current_perf_profile;
+
+	// DMA completion thread for async IO
+	struct ndma_h2d_dma_cmpltn_thread dma_cmpltn_thread;
 };
 
 #endif

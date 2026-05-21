@@ -6,6 +6,8 @@
 #ifndef NEURON_RING_H
 #define NEURON_RING_H
 
+#include <linux/atomic.h>
+
 #include "udma/udma.h"
 #include "share/neuron_driver_shared.h"
 
@@ -22,6 +24,29 @@ struct neuron_dma_eng_state;
 struct neuron_dma_queue_state;
 struct ndma_eng;
 struct ndma_ring;
+
+/*
+ * H2D DMA Completion Thread
+ * -------------------------
+ * one thread per ND.
+ * It is shared across rings for completion, remote pinning, and submission work.
+ *
+ * Async IO only.
+ *
+ * @thread: kthread handle
+ * @wait_queue: wait queue used to sleep/wake the thread
+ * @nonempty_ctxq_bitmap: bitmap of H2D ctx queues with pending work
+ * @stop: set to request thread exit
+ */
+struct ndma_h2d_dma_cmpltn_thread {
+	struct task_struct *thread;
+	wait_queue_head_t wait_queue;
+	atomic64_t nonempty_ctxq_bitmap;
+	volatile bool stop;
+};
+
+int ndma_h2d_create_cmpltn_thread(struct neuron_device *nd);
+void ndma_h2d_stop_cmpltn_thread(struct neuron_device *nd);
 
 /*
  * H2D DMA Completion Queue (CQ)
@@ -284,14 +309,13 @@ int ndmar_eng_set_state(struct neuron_device *nd, int eng_id, u32 state);
  * @tx_mc: Memory chunk backing TX queue
  * @rx_mc: Memory chunk backing RX queue
  * @rxc_mc: Memory chunk backing RX completion queue
- * @port: AXI port.
  * @allocatable: whether new descriptors can be added post queue init
  *
  * Return: 0 if queue init succeeds, a negative error code otherwise.
  */
 int ndmar_queue_init(struct neuron_device *nd, u32 eng_id, u32 qid, u32 tx_desc_count,
 		     u32 rx_desc_count, struct mem_chunk *tx_mc, struct mem_chunk *rx_mc,
-		     struct mem_chunk *rxc_mc, u32 port, bool allocatable);
+		     struct mem_chunk *rxc_mc, bool allocatable);
 
 /**
  * ndmar_queue_release() - Release a DMA queue.
@@ -426,7 +450,7 @@ int ndmar_h2t_ring_release(struct neuron_device *nd, int nc_id, int qid);
 /**
  * ndmar_h2t_ring_is_h2t() - return true if this is an h2t ring
  */
-static inline bool ndmar_h2t_ring_is_h2t(struct ndma_ring *ring)
+static inline bool ndmar_h2t_ring_is_h2t(const struct ndma_ring *ring)
 {
 	return (ring->h2t_completion_mc != NULL);
 }

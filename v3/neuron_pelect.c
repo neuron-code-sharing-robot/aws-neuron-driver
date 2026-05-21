@@ -96,6 +96,9 @@
  *     - If an election fails due to broken links, we attempt to run the election using only one link pair in an attempt to for two 2-node pairs.
  *       Currently we first attempt this on the right link, then if that fails, attempt the election again on the left link.
  *
+ *   - Impact of device reset failure on election/configuration
+ *     - If any device fails reset, the election is declared a failure and the platform will default to running single instance mode
+ *
  *   Election Results:
  *     Results of the election are reported in sysfs under /sys/class/neuron_device.
  *
@@ -356,7 +359,7 @@ static int npe_pod_neighbor_io_init(pod_neighbor_io_t* pnio, struct neuron_devic
 		goto done;
 	}
 
-	ret = ndmar_queue_init(nd, pnio->eng_id, 0, pnio->ring_size, pnio->ring_size, pnio->tx_mc, pnio->rx_mc, NULL, 0, true);
+	ret = ndmar_queue_init(nd, pnio->eng_id, 0, pnio->ring_size, pnio->ring_size, pnio->tx_mc, pnio->rx_mc, NULL, true);
 	if (ret) {
 		pr_err("pod election io queue init failed");
 		goto done;
@@ -1150,8 +1153,10 @@ int npe_election_exec_on_rst(struct neuron_device *nd, bool reset_successful)
 	int node_cnt;
 	u32 lr_neighbor_mask;
 	u64 pod_serial_number;
-	
+
+	// Declare election/configuration failed if any device fails reset
 	if (!reset_successful) {
+		ndhal_pelect_data.pod_state_internal = NEURON_NPE_POD_ST_ELECTION_FAILURE;
 		return 0;
 	}
 
@@ -1201,8 +1206,13 @@ int npe_election_exec_on_rst(struct neuron_device *nd, bool reset_successful)
 
 	// if we aren't kicking off election on first driver reset (testing) or 
 	// if we aren't in init state then we've already made an election decision.
+	// Since election is happening for ultra server, skipping the election is
+	// applied for the ultra-server only. In case of PDS, ignore election skip
+	// ctl.
 	//
-	if ((ndhal_pelect_data.pod_state_internal != NEURON_NPE_POD_ST_INIT) || npe_pod_ctl_is_set(NPE_POD_CTL_RST_SKIP_ELECTION)) {
+	if ((ndhal_pelect_data.pod_state_internal != NEURON_NPE_POD_ST_INIT) ||
+        (ndhal->ndhal_arch.platform_type != NEURON_PLATFORM_TYPE_PDS &&
+         npe_pod_ctl_is_set(NPE_POD_CTL_RST_SKIP_ELECTION))) {
 		goto done;
 	}
 
@@ -1633,6 +1643,47 @@ done:
 	_npe_get_pod_status(state, &node_id);
 	mutex_unlock(&ndhal_pelect_data.lock);
 	return ret;
+}
+
+/**
+ * npe_platform_ready() - check if the platform can support a given operation
+ *
+ *     UltraServers and PDS have to collect configuration data locally or from neighbors
+ *     this function determines if the platform supports a paritcular operation.  
+ *     Currently the only thing we wait on is for config data to be available on PDS 
+ *     droplets.  The time it takes to collect config data is constrained by reset time
+ *     across devices, so we block opens until config is complete on PDS servers.
+ *
+ */
+int npe_platform_ready(struct neuron_device *nd, enum neuron_platform_operation_type platform_operation)
+{
+	if (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_PDS) {
+		switch (platform_operation) {
+			case NEURON_PLATFORM_OP_TYPE_DEVOPEN:
+				if (npe_pod_state_busy()) { 
+					return -EBUSY;
+				} 
+				return 0;
+
+			case NEURON_PLATFORM_OP_TYPE_EXEC:
+				return 0;
+
+			default:
+				break;
+		}
+	} else if (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_ULTRASERVER) {
+		switch (platform_operation) {
+			case NEURON_PLATFORM_OP_TYPE_DEVOPEN:
+				return 0;
+
+			case NEURON_PLATFORM_OP_TYPE_EXEC:
+				return 0;
+
+			default:
+				break;
+		}
+	}
+	return 0;
 }
 
 static int npe_election_thread_fn(void *arg)

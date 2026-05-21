@@ -262,4 +262,45 @@ int ndma_zerocopy_submit(struct neuron_device *nd,
 						bool direction,
 						u64 sequence_num);
 
+/**
+ * Pre-pinned host memory support
+ *
+ * Allows userspace to pin host memory once and reuse it for multiple
+ * DMA transfers without the overhead of pinning/unpinning on each transfer.
+ * Uses VA as the lookup key - zerocopy operations auto-detect pinned memory.
+ */
+
+/**
+ * ndma_pinned_mem_destroy() - Cleanup pinned memory tracking subsystem
+ */
+void ndma_pinned_mem_destroy(void);
+
+/**
+ * ndma_pin_host_memory() - Pin host memory for accelerated DMA operations
+ * @va: User virtual address to pin
+ * @size: Size of memory to pin
+ *
+ * Pins host memory so zerocopy operations auto-detect pinned regions
+ * and skip per-transfer pinning. Uses fast path (pin_user_pages_fast)
+ * first, then falls back to slow path (pin_user_pages with mmap_lock)
+ * if needed.
+ *
+ * Return: 0 on success, -EEXIST if already pinned, negative errno on failure
+ */
+int ndma_pin_host_memory(u64 va, u64 size, u64 *pa_out);
+
+/**
+ * ndma_unpin_host_memory() - Unpin previously pinned host memory
+ * @va: VA that was used in ndma_pin_host_memory (exact match required)
+ *
+ * Return: 0 on success, -ENOENT if not found, -EPERM if not owner
+ */
+int ndma_unpin_host_memory(u64 va);
+
+/**
+ * ndma_pinned_mem_cleanup_process() - Cleanup all pinned memory for a process
+ * @pid: Process ID to cleanup
+ */
+void ndma_pinned_mem_cleanup_process(pid_t pid);
+
 #endif

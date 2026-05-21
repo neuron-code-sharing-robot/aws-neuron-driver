@@ -149,8 +149,9 @@ static int ndhal_register_funcs_trn3(void) {
 
 /* Instance names
  */
-#define NEURON_TRN3PDS_INSTANCE_NAME "trn3s.48xlarge"
+#define NEURON_TRN3PDS_INSTANCE_NAME "trn3.48xlarge"
 #define NEURON_TRN3PDS0_INSTANCE_NAME "trn3-dev0.48xlarge"
+#define NEURON_TRN3PDS1_INSTANCE_NAME "trn3-dev1.48xlarge"
 #define NEURON_TRN3P_INSTANCE_NAME "trn3p.48xlarge"
 
 static enum neuron_platform_type ndhal_platform_type_v4(void)
@@ -161,13 +162,18 @@ static enum neuron_platform_type ndhal_platform_type_v4(void)
 	if (narch_get_instance_type_name(buf, sizeof(buf))) goto done;
 	if ((strncmp(buf, NEURON_TRN3PDS_INSTANCE_NAME, sizeof(NEURON_TRN3PDS_INSTANCE_NAME)-1) == 0)) {
 		platform_type = NEURON_PLATFORM_TYPE_PDS;
-	} else if ((strncmp(buf, NEURON_TRN3PDS0_INSTANCE_NAME, sizeof(NEURON_TRN3PDS_INSTANCE_NAME)-1) == 0)) {
+	} else if ((strncmp(buf, NEURON_TRN3PDS0_INSTANCE_NAME, sizeof(NEURON_TRN3PDS0_INSTANCE_NAME)-1) == 0)) {
+		platform_type = NEURON_PLATFORM_TYPE_PDS;
+	} else if ((strncmp(buf, NEURON_TRN3PDS1_INSTANCE_NAME, sizeof(NEURON_TRN3PDS1_INSTANCE_NAME)-1) == 0)) {
 		platform_type = NEURON_PLATFORM_TYPE_PDS;
 	} else if ((strncmp(buf, NEURON_TRN3P_INSTANCE_NAME, sizeof(NEURON_TRN3P_INSTANCE_NAME)-1) == 0)) {
 		platform_type = NEURON_PLATFORM_TYPE_ULTRASERVER;
 	} else {
 		platform_type = NEURON_PLATFORM_TYPE_STD;
 	}
+
+	if (narch_is_qemu() || narch_is_emu())
+		platform_type = NEURON_PLATFORM_TYPE_STD;
 
 done:
 	return platform_type;
@@ -185,6 +191,32 @@ static bool ndhal_instance_type_3xl(void)
 
 done:
 	return instance_type_is_3xl;
+}
+
+/**
+ * ndmar_ctx_queue_bit_v4() - dummy ctx queue bitmap mapping for v4
+ * @h2d_eng_id: ignored
+ * @qid: ignored
+ *
+ * Async IO is not supported on v4 yet, so this hook is unused.
+ */
+static int ndmar_ctx_queue_bit_v4(uint32_t h2d_eng_id, uint32_t qid)
+{
+	return 0;
+}
+
+/**
+ * ndmar_ctx_queue_from_bit_v4() - dummy ctx queue bitmap reverse mapping for v4
+ * @bit: ignored
+ * @h2d_eng_id: returned DMA engine id placeholder
+ * @qid: returned DMA queue id placeholder
+ *
+ * Async IO is not supported on v4 yet, so this hook is unused.
+ */
+static void ndmar_ctx_queue_from_bit_v4(int bit, uint32_t *h2d_eng_id, uint32_t *qid)
+{
+	*h2d_eng_id = 0;
+	*qid = 0;
 }
 
 
@@ -252,13 +284,13 @@ static int mmap_get_bar4_offset_v4(u64 start_addr, u64 size, u64 *offset)
 {
 	u64 hbm_dist = narch_is_qemu() ? (ndhal->ndhal_pci.dram_bar_size / 4) : V4_HBM_SIZE;
 
-	if (start_addr >= V4_HBM_0_BASE && start_addr + size < V4_HBM_0_BASE + V4_HBM_ACTIVE_SIZE)
+	if (start_addr >= V4_HBM_0_BASE && start_addr + size <= V4_HBM_0_BASE + V4_HBM_ACTIVE_SIZE)
 		*offset = start_addr;
-	else if (start_addr >= V4_HBM_1_BASE && start_addr + size < V4_HBM_1_BASE + V4_HBM_ACTIVE_SIZE)
+	else if (start_addr >= V4_HBM_1_BASE && start_addr + size <= V4_HBM_1_BASE + V4_HBM_ACTIVE_SIZE)
 		*offset = start_addr - V4_HBM_1_BASE + hbm_dist;
-	else if (start_addr >= V4_HBM_2_BASE && start_addr + size < V4_HBM_2_BASE + V4_HBM_ACTIVE_SIZE)
+	else if (start_addr >= V4_HBM_2_BASE && start_addr + size <= V4_HBM_2_BASE + V4_HBM_ACTIVE_SIZE)
 		*offset = start_addr - V4_HBM_2_BASE + hbm_dist * 2;
-	else if (start_addr >= V4_HBM_3_BASE && start_addr + size < V4_HBM_3_BASE + V4_HBM_ACTIVE_SIZE)
+	else if (start_addr >= V4_HBM_3_BASE && start_addr + size <= V4_HBM_3_BASE + V4_HBM_ACTIVE_SIZE)
 		*offset = start_addr - V4_HBM_3_BASE + hbm_dist * 3;
 	else
 		return -EINVAL;
@@ -436,11 +468,14 @@ int ndhal_register_funcs_v4(void) {
 	}
 
 	ndhal->ndhal_arch.platform_type = ndhal_platform_type_v4();
+	ndhal->ndhal_fw_io.new_readless_read_min_api_version = 6;
 	ndhal->ndhal_pci.neuron_pci_get_device_id = neuron_pci_get_device_id_v4;
 	ndhal->ndhal_npe.npe_neighbor_eng_ids = npe_neighbor_eng_ids_v4;
 	ndhal->ndhal_mpset.mpset_set_dram_and_mpset_info = mpset_set_dram_and_mpset_info_v4;
 	ndhal->ndhal_mmap.dm_mmap_special = dm_mmap_special_v4;
 	ndhal->ndhal_mmap.mmap_get_bar4_offset = mmap_get_bar4_offset_v4;
+	ndhal->ndhal_ndmar.ndmar_ctx_queue_bit = ndmar_ctx_queue_bit_v4;
+	ndhal->ndhal_ndmar.ndmar_ctx_queue_from_bit = ndmar_ctx_queue_from_bit_v4;
 	ndhal->ndhal_cdev.ncdev_mem_regions = ncdev_mem_regions_v4;
 	ndhal->ndhal_perf.perf_update_hbm_7200_supported = perf_update_hbm_7200_supported_v4;
 
