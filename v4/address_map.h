@@ -71,7 +71,7 @@
 #define V4_TS_PER_DEVICE (V4_NC_PER_DEVICE * V4_TS_PER_NC)
 
 // max channels supported by V4 device
-#define V4_MAX_DRAM_CHANNELS 4
+#define V4_NUM_HBMS 4
 
 #define V4_SEMAPHORE_COUNT 256
 #define V4_EVENTS_COUNT 256
@@ -79,7 +79,7 @@
 #define V4_ALLOWED_DESC_PER_PACKET 64
 
 #define V4_MAX_NQ_QUEUES 16
-#define V4_MAX_NQ_TYPE 5
+#define V4_MAX_NQ_TYPE 6
 #define V4_MAX_NQ_SUPPORTED (V4_MAX_NQ_TYPE * V4_MAX_NQ_QUEUES)
 
 #define V4_APB_IO_0_BASE 0x00008000000000ull

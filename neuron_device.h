@@ -63,7 +63,7 @@ enum neuron_device_state {
 struct neuron_hbm_scrub_ctx {
 	struct mem_chunk *rx_mc[NUM_DMA_ENG_PER_DEVICE];
 	struct mem_chunk *tx_mc[NUM_DMA_ENG_PER_DEVICE];
-	struct mem_chunk *completion_marker_buf[MAX_DRAM_CHANNELS]; // one memchunk shared by all DMA engines for an HBM to reduce internal fragmentation
+	struct mem_chunk *completion_marker_buf[MAX_NUM_HBMS]; // one memchunk shared by all DMA engines for an HBM to reduce internal fragmentation
 	struct mem_chunk *hostbuf_mc[NUM_DMA_ENG_PER_DEVICE];
 };
 
@@ -89,9 +89,9 @@ struct neuron_device {
 	struct neuron_mempool_set mpset;
 
 	// memory chunk allocated for notification queue in each neuron core.
-	struct mem_chunk *nq_mc[MAX_NC_PER_DEVICE][MAX_NQ_SUPPORTED];
+	struct mem_chunk **nq_mc[MAX_NC_PER_DEVICE];
 	// memory chunk allocated for notification queue in each TOP_SP.
-	struct mem_chunk *ts_nq_mc[MAX_TS_PER_DEVICE][MAX_NQ_SUPPORTED];
+	struct mem_chunk **ts_nq_mc[MAX_TS_PER_DEVICE];
 
 	// memory chunk for setting device mem
 	struct mem_chunk *memset_mc;

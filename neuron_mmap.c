@@ -502,7 +502,7 @@ int nmmap_get_va_placement(void *va, int *device_index, int *hbm_index)
 		}
 		write_unlock(&nd->mpset.rbmmaplock);
 		if (hbm_pa != (u64)-1) { // found it, now find HBM
-			for (hbm = 0; hbm < ndhal->ndhal_address_map.dram_channels; hbm++) {
+			for (hbm = 0; hbm < ndhal->ndhal_address_map.num_hbms; hbm++) {
 				u64 start = ndhal->ndhal_mpset.device_dram_effective_base_addr[hbm];
 				u64 end = ndhal->ndhal_mpset.device_dram_end_addr[hbm];
 				if (hbm_pa >= start && hbm_pa < end) {

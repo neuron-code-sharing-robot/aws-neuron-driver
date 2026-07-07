@@ -19,9 +19,10 @@
  * @addr: Device buffer virtual address
  * @size: Device buffer size (in bytes)
  * @fd: dma-buf fd
+ * @offset: offset of virtual address within dmabuf
  *
  * Return: 0 on success, error code on failure
  */
-int ndmabuf_get_fd(u64 va, u64 size, int *fd);
+int ndmabuf_get_fd(u64 va, u64 size, int *fd, u64 *offset);
 
 #endif

@@ -193,7 +193,7 @@ int ncrwl_nc_range_mark(u32 nc_count, u32 start_nc_index, u32 end_nc_index,
 	if (start_nc_index > end_nc_index ||
 		    start_nc_index >= MAX_NEURON_DEVICE_COUNT * MAX_NC_PER_DEVICE ||
 		    end_nc_index >= MAX_NEURON_DEVICE_COUNT * MAX_NC_PER_DEVICE)
-		return -EINVAL;
+		return -ENXIO;
 	mutex_lock(&ncrwl_range_lock);
 	for (i = start_nc_index; i <= end_nc_index; i++) {
 		int range_len = 1;

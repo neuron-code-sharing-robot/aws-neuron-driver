@@ -187,8 +187,8 @@ TRACE_EVENT(ioctl_mem_alloc,
 		__entry->mc->mem_location == MEM_LOC_HOST ? "HOST": "DEVICE",
 		__entry->mc->pa,
 		__entry->mc->size,
-		__entry->mc->dram_channel,
-		__entry->mc->dram_region,
+		__entry->mc->hbm_index,
+		0,
 		__entry->mc
 	));
 

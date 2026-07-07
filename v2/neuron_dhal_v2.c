@@ -309,8 +309,7 @@ static void ts_nq_set_hwaddr_v2(struct neuron_device *nd, u8 ts_id, u8 index, u3
  * @nq_type: type of the notification queue
  * @size: size of queue in bytes
  * @on_host_memory: if true, NQ is created in host memory
- * @dram_channel: If NQ is created on device memory which DRAM channel to use.
- * @dram_region: If NQ is created on device memory which DRAM region to use.
+ * @hbm_index: If NQ is created on device memory which HBM to use.
  * @force_alloc_mem: If true, force allocate new memory (and delete already allocated memory, if any)
  * @nq_mc[out]: memchunk used by the NQ will be written here
  * @mc_ptr[out]: Pointer to memchunk backing this NQ
@@ -318,7 +317,7 @@ static void ts_nq_set_hwaddr_v2(struct neuron_device *nd, u8 ts_id, u8 index, u3
  * Return: 0 on if initialization succeeds, a negative error code otherwise.
  */
 static int ts_nq_init_v2(struct neuron_device *nd, u8 ts_id, u8 eng_index, u32 nq_type, u32 size,
-				u32 on_host_memory, u32 dram_channel, u32 dram_region,
+				u32 on_host_memory, u32 hbm_index,
 				bool force_alloc_mem, struct mem_chunk **nq_mc, u64 *mmap_offset)
 {
 	// Check that size is power of 2
@@ -331,7 +330,7 @@ static int ts_nq_init_v2(struct neuron_device *nd, u8 ts_id, u8 eng_index, u32 n
 		return -EINVAL;
 
 	u8 nq_id = ts_nq_get_nqid_v2(nd, eng_index, nq_type);
-	if (nq_id >= MAX_NQ_SUPPORTED)
+	if (nq_id >= V2_MAX_NQ_SUPPORTED)
 		return -EINVAL;
 
 	struct mem_chunk *mc = nd->ts_nq_mc[ts_id][nq_id];
@@ -339,7 +338,7 @@ static int ts_nq_init_v2(struct neuron_device *nd, u8 ts_id, u8 eng_index, u32 n
 		struct mem_chunk *_mc = NULL;
 		u32 nc_id = ts_id / (V2_TS_PER_DEVICE / V2_NC_PER_DEVICE);
 		int ret = mc_alloc_align(nd, MC_LIFESPAN_DEVICE, size, (on_host_memory) ? 0 : size, on_host_memory ? MEM_LOC_HOST : MEM_LOC_DEVICE,
-				   dram_channel, dram_region, nc_id, on_host_memory ? NEURON_MEMALLOC_TYPE_NOTIFICATION_HOST : NEURON_MEMALLOC_TYPE_NOTIFICATION_DEVICE, &_mc);
+				   hbm_index, nc_id, on_host_memory ? NEURON_MEMALLOC_TYPE_NOTIFICATION_HOST : NEURON_MEMALLOC_TYPE_NOTIFICATION_DEVICE, &_mc);
 		if (ret)
 			return ret;
 		ts_nq_set_hwaddr_v2(nd, ts_id, eng_index, nq_type, size, _mc->pa);
@@ -467,8 +466,7 @@ static void nnq_set_hwaddr_v2(struct neuron_device *nd, u8 nc_id, u8 index, u32 
  */
 static void mpset_set_dram_and_mpset_info_v2(struct neuron_mempool_set *mpset, u64 *device_dram_addr, u64 *device_dram_size)
 {
-	mpset->num_channels = V2_MAX_DRAM_CHANNELS;
-	mpset->mp_device_num_regions = 1;
+	mpset->num_hbms = V2_NUM_HBMS;
 	device_dram_addr[0] = V2_HBM_0_BASE;
 	device_dram_addr[1] = V2_HBM_1_BASE;
 	device_dram_size[0] = V2_HBM_0_SIZE;
@@ -1400,7 +1398,7 @@ static void ndhal_ext_cleanup_v2(void)
  * static asserts to valid static const sizes work across versions
  *
  */
-static_assert( MAX_DRAM_CHANNELS >= V2_MAX_DRAM_CHANNELS, "Max dram channel count too small");
+static_assert( MAX_NUM_HBMS >= V2_NUM_HBMS, "Max dram channel count too small");
 static_assert( MAX_TS_PER_DEVICE >= V2_TS_PER_DEVICE, "Max ts per device count too small");
 static_assert( MAX_NC_PER_DEVICE >= V2_NC_PER_DEVICE, "Max nc per device count too small");
 static_assert( MAX_NQ_TYPE >= V2_MAX_NQ_TYPE, "Max nq type count too small");
@@ -1435,7 +1433,8 @@ int ndhal_register_funcs_v2(void) {
 	ndhal->ndhal_address_map.event_count = V2_EVENTS_COUNT;
 	ndhal->ndhal_address_map.ts_per_device = V2_TS_PER_DEVICE;
 	ndhal->ndhal_address_map.dma_eng_per_nc = V2_DMA_ENG_PER_NC;
-	ndhal->ndhal_address_map.dram_channels = V2_MAX_DRAM_CHANNELS;
+	ndhal->ndhal_address_map.num_hbms = V2_NUM_HBMS;
+	ndhal->ndhal_address_map.nq_per_nc = V2_MAX_NQ_SUPPORTED;
 	ndhal->ndhal_reset.initiate_max_wait_time = V2_NR_RESET_INIT_MAX_TOTAL_WAIT_TIME_MS;
 	ndhal->ndhal_reset.retry_count = NR_RESET_RETRY_COUNT;
 	ndhal->ndhal_reset.nr_post_reset_config = nr_post_reset_config_v2;

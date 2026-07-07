@@ -979,6 +979,7 @@ struct ndma_h2t_zcdma_context {
 											  // host memory buffer which driver polls on for completions;
 											  // managed by completion_pool in ctx queue
 	u64                   sequence_num;       // async sequence number; 0 for sync transfers
+	void                 *context;            // async completion context
 
 	// Async-only
 	struct mm_struct     *mm;                 // mm that owns the user buffers
@@ -1015,6 +1016,7 @@ static void ndma_zc_release_ctx(struct ndma_h2t_zcdma_context *ctx, u64 *nr_pinn
 
 	ctx->state = NDMA_INVALID;
 	ctx->sequence_num = 0;
+	ctx->context = NULL;
 }
 
 /* H2D DMA Completion Queue (CQ) */
@@ -1028,7 +1030,7 @@ int ndma_h2d_compl_queue_init(struct neuron_device *nd, struct ndma_h2d_compl_qu
 
 	queue_size = sizeof(neuron_h2d_dma_compl_queue_t) + (NDMA_H2D_COMPL_QUEUE_CAPACITY * sizeof(neuron_h2d_dma_compl_queue_entry_t));
 	ret = mc_alloc_align(nd, MC_LIFESPAN_DEVICE, queue_size, 0,
-						 MEM_LOC_HOST, 0, 0, 0,
+						 MEM_LOC_HOST, 0, 0,
 						 NEURON_MEMALLOC_TYPE_NCDEV_HOST, &mc);
 	if (ret) {
 		pr_err("failed to allocate h2d dma completion queue mc: %d\n", ret);
@@ -1263,19 +1265,21 @@ static struct ndma_h2t_zcdma_context *ndma_ctx_queue_pop_submitted(struct ndma_c
 /* Failure-path helper.
  * Given a sequence number of a async request, wait for any matching submitted ctxs, then reset all matching ctxs.
  * This prevents further remote pinning and submitting on a failed async request.
- * Mostly used in failure and cleanup paths, so don't stop on failed DMAs.
+ * Once a wait times out, skip waiting on subsequent contexts (engine is stuck).
  */
 static void ndma_ctx_queue_drain_sequence(struct ndma_ctx_queue *queue, u64 sequence_num)
 {
 	u32 idx;
+	bool timed_out = false;
 
 	for (idx = queue->head; idx != queue->tail; idx = (idx + 1) & queue->capacity_mask) {
 		struct ndma_h2t_zcdma_context *ctx = &queue->entries[idx];
 
 		if (ctx->sequence_num == sequence_num) {
-			// wait for already submitted DMAs to complete.
-			if (ctx->state == NDMA_SUBMITTED) {
-				ndma_memcpy_wait_for_completion(ctx->eng, ctx->ring, ctx->nr_desc + 1, ctx->completion_ptr, false, false);
+			// wait for already submitted DMAs to complete, unless engine already timed out.
+			if (ctx->state == NDMA_SUBMITTED && !timed_out) {
+				if (ndma_memcpy_wait_for_completion(ctx->eng, ctx->ring, ctx->nr_desc + 1, ctx->completion_ptr, false, false))
+					timed_out = true;
 			}
 
 			// release pinned pages and mm, and set state to invalid (tombstone).
@@ -1292,17 +1296,20 @@ static void ndma_ctx_queue_drain_sequence(struct ndma_ctx_queue *queue, u64 sequ
 /* Failure-path helper.
  * Wait for submitted contexts from head up to (but not including) first_pinned_unsubmitted.
  * Unpin from head up to (but not including) first_unpinned.
- * Mostly used in failure and cleanup paths, so don't stop on failed DMAs.
+ * Once a wait times out, skip waiting on subsequent contexts (engine is stuck).
  */
 static void ndma_ctx_queue_drain(struct ndma_eng *eng,
 								 struct ndma_ring *ring,
 								 struct ndma_ctx_queue *queue)
 {
+	bool timed_out = false;
+
 	while (!ndma_ctx_queue_is_empty(queue)) {
 		struct ndma_h2t_zcdma_context *ctx = ndma_ctx_queue_pop_head(queue);
 
-		if (ctx->state == NDMA_SUBMITTED) {
-			ndma_memcpy_wait_for_completion(eng, ring, ctx->nr_desc + 1, ctx->completion_ptr, false, false);
+		if (ctx->state == NDMA_SUBMITTED && !timed_out) {
+			if (ndma_memcpy_wait_for_completion(eng, ring, ctx->nr_desc + 1, ctx->completion_ptr, false, false))
+				timed_out = true;
 		}
 
 		ndma_zc_release_ctx(ctx, &queue->nr_pinned_pages);
@@ -1670,7 +1677,8 @@ int ndma_zerocopy_submit(struct neuron_device *nd,
 			 dma_addr_t dev_base,
 			 int qid,
 			 bool direction,
-			 u64 sequence_num)
+			 u64 sequence_num,
+			 void *context)
 {
 	int ret = 0;
 	int i = 0;
@@ -1757,6 +1765,7 @@ int ndma_zerocopy_submit(struct neuron_device *nd,
 				cur_ctx->mm             = NULL;
 				cur_ctx->pid		    = task_tgid_nr(current);
 				cur_ctx->sequence_num   = sequence_num;
+				cur_ctx->context        = context;
 
 				/* Pin now if possible; otherwise capture mm for remote pinning (async only). */
 				if (can_pin) {
@@ -1892,10 +1901,10 @@ static int ndma_zerocopy_complete(struct neuron_device *nd,
 		if (ret) {
 			err = ret;
 			pr_err("async h2d dma completion failed for seq num %llu: %d\n", submitted_ctx->sequence_num, ret);
-			ndma_h2d_compl_queue_put(&ring->dma_compl_queue, submitted_ctx->sequence_num, ret, NULL);
+			ndma_h2d_compl_queue_put(&ring->dma_compl_queue, submitted_ctx->sequence_num, ret, submitted_ctx->context);
 			ndma_ctx_queue_drain_sequence(ctx_queue, submitted_ctx->sequence_num);
 		} else if (submitted_ctx->last) {
-			ndma_h2d_compl_queue_put(&ring->dma_compl_queue, submitted_ctx->sequence_num, 0, NULL);
+			ndma_h2d_compl_queue_put(&ring->dma_compl_queue, submitted_ctx->sequence_num, 0, submitted_ctx->context);
 		}
 
 		ndma_zc_release_ctx(submitted_ctx, &ctx_queue->nr_pinned_pages);
@@ -1914,7 +1923,7 @@ static int ndma_zerocopy_complete(struct neuron_device *nd,
 		if (ret) {
 			err = ret;
 			pr_err("async h2d dma submission failed for seq num %llu: %d\n", pinned_unsubmitted_ctx->sequence_num, ret);
-			ndma_h2d_compl_queue_put(&ring->dma_compl_queue, pinned_unsubmitted_ctx->sequence_num, ret, NULL);
+			ndma_h2d_compl_queue_put(&ring->dma_compl_queue, pinned_unsubmitted_ctx->sequence_num, ret, pinned_unsubmitted_ctx->context);
 			ndma_ctx_queue_drain_sequence(ctx_queue, pinned_unsubmitted_ctx->sequence_num);
 		} else {
 			ndma_ctx_queue_inc_first_pinned_unsubmitted(ctx_queue);
@@ -1934,7 +1943,7 @@ static int ndma_zerocopy_complete(struct neuron_device *nd,
 		if (ret) {
 			err = ret;
 			pr_err("async h2d dma remote pinning failed for seq num %llu: %d\n", unpinned_ctx->sequence_num, ret);
-			ndma_h2d_compl_queue_put(&ring->dma_compl_queue, unpinned_ctx->sequence_num, ret, NULL);
+			ndma_h2d_compl_queue_put(&ring->dma_compl_queue, unpinned_ctx->sequence_num, ret, unpinned_ctx->context);
 			ndma_ctx_queue_drain_sequence(ctx_queue, unpinned_ctx->sequence_num);
 		} else {
 			ndma_ctx_queue_inc_first_unpinned(ctx_queue);

@@ -71,7 +71,7 @@
 #define V3_TS_PER_DEVICE (V3_NC_PER_DEVICE * V3_TS_PER_NC)
 
 // max channels supported by V3 device
-#define V3_MAX_DRAM_CHANNELS 4
+#define V3_NUM_HBMS 4
 
 #define V3_SEMAPHORE_COUNT 256
 #define V3_EVENTS_COUNT 256
@@ -79,7 +79,7 @@
 #define V3_ALLOWED_DESC_PER_PACKET 64
 
 #define V3_MAX_NQ_QUEUES 16
-#define V3_MAX_NQ_TYPE 5
+#define V3_MAX_NQ_TYPE 6
 #define V3_MAX_NQ_SUPPORTED (V3_MAX_NQ_TYPE * V3_MAX_NQ_QUEUES)
 
 #define V3_APB_IO_0_BASE 0x00008000000000ull

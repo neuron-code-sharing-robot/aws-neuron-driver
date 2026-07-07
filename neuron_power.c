@@ -95,6 +95,51 @@ static inline u16 npower_get_sample_num(u32 power_sample)
 }
 
 /**
+ * npower_classify_die_observation() - figure out what the per-die cache should say after
+ *                                     a single power read attempt
+ *
+ * @read_ret: the return value from the firmware read (0 on success, an error code
+ *            otherwise)
+ * @raw_sample: the raw power sample word from firmware.  Only meaningful when @read_ret
+ *              is 0.
+ * @entry: location to fill in with the cache entry we should store after this
+ *         observation
+ *
+ * This function is pure - it doesn't touch any locks or any device state - so it's easy
+ * to reason about and easy to unit test.
+ *
+ * The rules:
+ *   - If the read failed, record a READ_ERROR.
+ *   - If the read succeeded but firmware handed us a util value that's outside the legal
+ *     range, record a BOGUS entry holding the offending value (we keep it around so the
+ *     sysfs row can show it for debugging).
+ *   - Otherwise, record a GOOD entry with the new util/counter pair.
+ */
+static void npower_classify_die_observation(int read_ret, u32 raw_sample,
+                                            struct neuron_power_die_cache_entry *entry)
+{
+	u16 util;
+	u16 cnt;
+
+	if (read_ret != 0) {
+		entry->populated = true;
+		entry->state = NEURON_POWER_DIE_STATE_READ_ERROR;
+		entry->util_bips = 0;
+		entry->counter = 0;
+		return;
+	}
+
+	util = npower_get_utilization(raw_sample);
+	cnt = npower_get_sample_num(raw_sample);
+
+	entry->populated = true;
+	entry->state = (util > NEURON_MAX_POWER_UTIL_BIPS) ? NEURON_POWER_DIE_STATE_BOGUS
+	                                                  : NEURON_POWER_DIE_STATE_GOOD;
+	entry->util_bips = util;
+	entry->counter = cnt;
+}
+
+/**
  * npower_store_utilization() - Store a sample of neuron power utilization data in the set of
  *                              samples for a device
  *
@@ -266,6 +311,41 @@ static bool npower_in_simulated_env(void)
         return narch_is_qemu() || narch_is_emu();
 }
 
+/**
+ * npower_update_die_cache() - update the per-die cache entry for a single die based on a
+ *                             freshly-read power sample from firmware
+ *
+ * @nd: pointer to the neuron device whose cache we are updating
+ * @die: which die's cache entry to update
+ * @read_ret: the return value from the firmware read for this die
+ * @raw_sample: the raw power sample word read from firmware.  Only meaningful when
+ *              @read_ret is 0.  Low 16 bits are util_bips, high 16 bits are the sample
+ *              counter.
+ *
+ * The caller is responsible for performing the firmware read before calling this - we
+ * never issue MMIO ourselves.  We classify the new observation outside the lock and then
+ * take stats_lock just long enough to store the result, so we never hold stats_lock
+ * across firmware I/O and a concurrent sysfs reader can't observe a torn cache entry.
+ *
+ * Note that this overwrites the cache entry on every call.  In particular, we don't
+ * suppress duplicate counters here the way npower_select_power() does for the aggregate
+ * stats - the aggregator gate exists to keep the per-minute stats from being skewed by
+ * stale firmware samples, but this cache just needs to mirror what the previous live
+ * sysfs read path used to return, including transient READ_ERROR and BOGUS states.
+ * Don't try to unify the two.
+ */
+static void __maybe_unused npower_update_die_cache(struct neuron_device *nd, unsigned die,
+                                                   int read_ret, u32 raw_sample)
+{
+        struct neuron_power_die_cache_entry next;
+
+        npower_classify_die_observation(read_ret, raw_sample, &next);
+
+        npower_acquire_lock(nd);
+        nd->power.per_die_cache[die] = next;
+        npower_release_lock(nd);
+}
+
 static void npower_select_power(struct neuron_device *nd, u32 power_samples[NEURON_POWER_MAX_DIE])
 {
         bool duplicate_read = false;
@@ -327,6 +407,13 @@ int npower_sample_utilization(void *dev)
                 // component parts so we can do calculations on the power.
                 for (die = 0; die <  ndhal->ndhal_address_map.dice_per_device; die++) {
                     ret[die] = fw_io_device_power_read(nd->npdev.bar0, &power_samples[die], die);
+
+                    // Mirror this observation into the per-die cache that backs the raw
+                    // sysfs read path.  We do this whether or not the read succeeded,
+                    // independently of npower_select_power's duplicate-tick gate below.
+                    // See npower_update_die_cache for why these two paths intentionally
+                    // don't share the same gating rule.
+                    npower_update_die_cache(nd, die, ret[die], power_samples[die]);
 
                     if (ret[die]) {
                             failed_read = true; // Note for later when we determine whether we have data to store
@@ -425,6 +512,92 @@ int npower_format_stats(void *dev, char buffer[], unsigned bufflen)
                 ((bytes_formatted == bufflen) && buffer[bufflen - 1] != '\0'));
 }
 
+/**
+ * npower_emit_die_row() - format a single per-die row of the raw sysfs output from a
+ *                         cache snapshot
+ *
+ * @die: the die index to print at the start of the row
+ * @snapshot: pointer to a cache entry that the caller has already copied out of
+ *            per_die_cache[] under stats_lock.  We operate on the caller's snapshot, so
+ *            we don't need to take any locks ourselves.
+ * @buf: where to write the row
+ * @bufflen: how much room is left in @buf
+ *
+ * Returns the number of bytes written, with the same scnprintf truncation semantics that
+ * the rest of this file uses, so the caller can just add this to its running offset.
+ *
+ * The output is one of these four forms, picked based on what the snapshot says:
+ *   <die>,unavailable          - we haven't gotten a sample for this die yet, or the
+ *                                snapshot is otherwise unpopulated
+ *   <die>,<util_bips>,<counter> - normal good reading
+ *   <die>,read_error           - the most recent firmware read for this die failed
+ *   <die>,bogus(<util>),<counter> - firmware returned an out-of-range value; we keep the
+ *                                   offending value visible to make debugging easier
+ */
+static unsigned __maybe_unused
+npower_emit_die_row(unsigned die,
+                    const struct neuron_power_die_cache_entry *snapshot,
+                    char *buf, unsigned bufflen)
+{
+        if (!snapshot->populated) {
+                return scnprintf(buf, bufflen, "%u,unavailable\n", die);
+        }
+
+        switch (snapshot->state) {
+        case NEURON_POWER_DIE_STATE_READ_ERROR:
+                return scnprintf(buf, bufflen, "%u,read_error\n", die);
+        case NEURON_POWER_DIE_STATE_BOGUS:
+                return scnprintf(buf, bufflen, "%u,bogus(%u),%u\n",
+                                 die, snapshot->util_bips, snapshot->counter);
+        case NEURON_POWER_DIE_STATE_GOOD:
+        default:
+                return scnprintf(buf, bufflen, "%u,%u,%u\n",
+                                 die, snapshot->util_bips, snapshot->counter);
+        }
+}
+
+int npower_format_raw(void *dev, char buffer[], unsigned bufflen)
+{
+        struct neuron_device *nd = (struct neuron_device *)dev;
+        struct neuron_power_die_cache_entry snapshot[NEURON_POWER_MAX_DIE];
+        unsigned offset = 0;
+        unsigned die;
+        unsigned dice;
+
+        // Always emit the header first.
+        offset += scnprintf(buffer + offset, bufflen - offset, "die,util_bips,counter\n");
+
+        // Top-level unavailability: if the device isn't ready, we're in simulation, or
+        // firmware doesn't support power readings, just emit "unavailable" for every die.
+        // We don't take stats_lock or look at per_die_cache[] in that case - there's
+        // nothing useful in there anyway.
+        if (!nd || nd->device_state != NEURON_DEVICE_STATE_READY ||
+            npower_in_simulated_env() || !npower_enabled_in_fw(nd)) {
+                for (die = 0; die < ndhal->ndhal_address_map.dice_per_device; die++) {
+                        offset += scnprintf(buffer + offset, bufflen - offset,
+                                            "%u,unavailable\n", die);
+                }
+                return 0;
+        }
+
+        // Snapshot the cache under stats_lock and do all the formatting outside the lock.
+        // Holding the lock just across a memcpy keeps it cheap, ensures no scnprintf runs
+        // under it, and guarantees that each formatted row reflects a single, complete
+        // cache write rather than a torn update.  We don't issue MMIO from here at all -
+        // the periodic sampler is the sole producer of per-die state.
+        npower_acquire_lock(nd);
+        memcpy(snapshot, nd->power.per_die_cache, sizeof(snapshot));
+        npower_release_lock(nd);
+
+        dice = ndhal->ndhal_address_map.dice_per_device;
+        for (die = 0; die < dice; die++) {
+                offset += npower_emit_die_row(die, &snapshot[die],
+                                              buffer + offset, bufflen - offset);
+        }
+
+        return 0;
+}
+
 int npower_init_stats(struct neuron_device *nd)
 {
         u16 zero_counter_array[NEURON_POWER_MAX_DIE] = { 0 };
@@ -442,6 +615,11 @@ int npower_init_stats(struct neuron_device *nd)
         npower_acquire_lock(nd);
         memset(&nd->power.current_stats, 0, sizeof(struct neuron_power_stats));
         nd->power.current_stats.status = POWER_STATUS_NO_DATA;
+
+        // Reset the per-die cache.  Zeroing it leaves every entry with populated=false,
+        // which is the only thing the sysfs reader cares about until the sampler fills
+        // entries in - the other fields are just along for the ride at this point.
+        memset(&nd->power.per_die_cache, 0, sizeof(nd->power.per_die_cache));
         npower_release_lock(nd);
 
         return 0;

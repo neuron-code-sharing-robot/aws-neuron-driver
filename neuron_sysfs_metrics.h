@@ -78,6 +78,7 @@ enum nsysfsmetric_non_nds_ids { // The metrics needed by sysfs metrics but not s
 	NON_NDS_HEALTH_STATUS_HBM_UE_COUNT,
 	NON_NDS_HEALTH_STATUS_REPAIRABLE_HBM_UE_COUNT,
 	NON_NDS_HEALTH_STATUS_HW_ERROR_EVENT,
+	NON_NDS_OTHER_POWER_UTILIZATION_RAW,
 };
 
 struct neuron_device;

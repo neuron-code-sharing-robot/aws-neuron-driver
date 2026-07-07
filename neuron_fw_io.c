@@ -820,19 +820,19 @@ static inline uint32_t repairable_ecc_err_count(uint32_t api_version, uint32_t e
 void fw_io_get_total_ecc_err_counts(void *bar0, uint32_t *unrepairable_ecc_count, uint32_t *repairable_ecc_count) {
 	uint32_t total_unrepairable_ecc_err_count = 0;
 	uint32_t total_repairable_ecc_err_count = 0;
-	uint32_t channel = 0;
+	uint32_t hbm_index = 0;
 	uint32_t ecc_err_count = 0;
 	uint64_t ecc_offset = 0;
 
 	uint32_t api_version;
 	fw_io_api_version_read(bar0, &api_version);
 
-	for (channel = 0; channel < ndhal->ndhal_address_map.dram_channels; channel++) {
-		ecc_offset = FW_IO_REG_HBM0_ECC_OFFSET + channel * sizeof(uint32_t);
+	for (hbm_index = 0; hbm_index < ndhal->ndhal_address_map.num_hbms; hbm_index++) {
+		ecc_offset = FW_IO_REG_HBM0_ECC_OFFSET + hbm_index * sizeof(uint32_t);
 		ecc_err_count = 0;
 		int ret = fw_io_ecc_read(bar0, ecc_offset, &ecc_err_count);
 		if (ret) {
-			pr_err("sysfs failed to read ECC HBM%u error from FWIO\n", channel);
+			pr_err("sysfs failed to read ECC HBM%u error from FWIO\n", hbm_index);
 		} else if (ecc_err_count != 0xdeadbeef) {
 			total_unrepairable_ecc_err_count += unrepairable_ecc_err_count(api_version, ecc_err_count);
 			total_repairable_ecc_err_count += repairable_ecc_err_count(api_version, ecc_err_count);

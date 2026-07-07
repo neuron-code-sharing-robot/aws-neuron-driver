@@ -81,9 +81,48 @@ struct neuron_power_stats {
         u16 max_power_bips;
 };
 
+/**
+ * Per-die state recorded by the sampler each tick.
+ *
+ *   GOOD       - read succeeded and util_bips <= NEURON_MAX_POWER_UTIL_BIPS.
+ *   READ_ERROR - the firmware read returned a nonzero error.
+ *   BOGUS      - the read succeeded but util_bips was out of range.
+ */
+enum neuron_power_die_state {
+        NEURON_POWER_DIE_STATE_GOOD = 0,
+        NEURON_POWER_DIE_STATE_READ_ERROR,
+        NEURON_POWER_DIE_STATE_BOGUS,
+};
+
+/**
+ * One per-die cache entry. Written by the sampler-side cache update helper,
+ * read by npower_format_raw(). Access is serialized by stats_lock.
+ *
+ * @populated: False until the sampler has read power data for this die since 
+ *             the last npower_init_stats(); while false, no other field is 
+ *             meaningful and the formatter emits "<die>,unavailable\n".
+ * @state:     last per-die state. Only read when populated.
+ * @util_bips: if state == GOOD: cached in-range util reading.
+ *             if state == BOGUS: the offending out-of-range util value (so the formatter
+ *                    can emit "bogus(<util_bips>)").
+ *             if state == READ_ERROR: undefined.
+ * @counter:   if state == GOOD or BOGUS: firmware sample counter associated with util_bips.
+ *             if state == READ_ERROR: undefined.
+ */
+struct neuron_power_die_cache_entry {
+        bool populated;
+        enum neuron_power_die_state state;
+        u16 util_bips;
+        u16 counter;
+};
+
 struct neuron_power {
         struct neuron_power_samples current_samples; // Unaggregated raw data for the current period
         struct neuron_power_stats current_stats; // Aggregated stats from the last completed period
+        // Per-die cache backing the raw power sysfs interface. Updated by
+        // the periodic sampler, read by npower_format_raw(). Serialized by
+        // stats_lock.
+        struct neuron_power_die_cache_entry per_die_cache[NEURON_POWER_MAX_DIE];
         struct mutex stats_lock;
 };
 
@@ -116,6 +155,20 @@ int npower_sample_utilization(void *dev);
   *       and will return a formatted string if it receives invalid parameters (e.g. a null nd pointer)
   */
 int npower_format_stats(void *nd, char buffer[], unsigned int bufflen);
+
+/**
+ * npower_format_raw() - Read live per-die power utilization from firmware and
+ *                       format it as CSV.  Unlike npower_format_stats, this
+ *                       does not consult the per-minute aggregate; it issues a
+ *                       fresh MMIO read on every call so callers can poll at
+ *                       the firmware refresh rate.
+ *
+ * @nd: expected to point to a struct neuron_device
+ * @buffer / @bufflen: destination
+ *
+ * Returns 0 on success.
+ */
+int npower_format_raw(void *nd, char buffer[], unsigned int bufflen);
 
 /**
  * npower_init_power_stats() - Initializes power stats for the specified neuron device upon boot

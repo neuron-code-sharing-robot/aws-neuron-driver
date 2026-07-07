@@ -26,6 +26,11 @@ int npe_election_exec_on_rst(struct neuron_device *nd, bool reset_successful);
 int npe_init(void);
 
 /**
+ * npe_pds_config_init() - initialize PDS/MAX platform topology from firmware
+ */
+void npe_pds_config_init(void);
+
+/**
  * npe_cleanup() - cleanup and pod state left around (miscram)
  *
  */

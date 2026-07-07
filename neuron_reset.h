@@ -35,6 +35,7 @@ struct neuron_reset_request {
 	uint32_t request_id;
 	uint32_t nc_map;
 	volatile enum neuron_reset_state ret;
+	volatile int error_code;
 	volatile struct neuron_reset_request *next;
 	volatile struct neuron_reset_request *prev;
 };
@@ -59,7 +60,7 @@ struct neuron_reset {
  *
  * @nd: Neuron device which will be reset by the thread.
  *
- * Return: 0 on success, -1 on failure
+ * Return: 0 on success, negative errno on failure
  */
 int nr_create_thread(struct neuron_device *nd);
 
@@ -84,7 +85,7 @@ void nr_start(struct neuron_device *nd);
  * @nc_map: Neuron core to reset (NEURON_NC_MAP_DEVICE to reset all cores)
  * @request_id: ID of this reset request
  *
- * Return: 0 if reset was successfully queued, 1 otherwise.
+ * Return: 0 if reset was successfully queued, negative errno otherwise.
  */
 int nr_start_ncs(struct neuron_device *nd, uint32_t nc_map, uint32_t request_id);
 
@@ -95,7 +96,7 @@ int nr_start_ncs(struct neuron_device *nd, uint32_t nc_map, uint32_t request_id)
  * @request_id: The reset request id to wait for
  * @check: If true, return success if request_id is not in the queue.
  *
- * Return: 0 if reset was successfully completed, 1 otherwise.
+ * Return: 0 if reset was successfully completed, negative errno otherwise.
  */
 int nr_wait(struct neuron_device *nd, uint32_t request_id, bool check);
 
