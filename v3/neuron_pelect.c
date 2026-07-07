@@ -292,7 +292,7 @@ typedef struct pod_neighbor_io {
 	struct mem_chunk *data_mc;
 } pod_neighbor_io_t;
 
-static void npe_pds_config_init(void);
+void npe_pds_config_init(void);
 
 static bool npe_pod_ctl_is_set(int value)
 {
@@ -341,19 +341,19 @@ static int npe_pod_neighbor_io_init(pod_neighbor_io_t* pnio, struct neuron_devic
 		goto done;
 	}
 
-	ret = mc_alloc_align(nd, MC_LIFESPAN_LOCAL, pnio->ring_size * sizeof(union udma_desc), 0, MEM_LOC_HOST, 0, 0, 0, NEURON_MEMALLOC_TYPE_MISC_HOST, &pnio->tx_mc);
+	ret = mc_alloc_align(nd, MC_LIFESPAN_LOCAL, pnio->ring_size * sizeof(union udma_desc), 0, MEM_LOC_HOST, 0, 0, NEURON_MEMALLOC_TYPE_MISC_HOST, &pnio->tx_mc);
 	if (ret) {
 		pr_err("ultraserver election io memory allocation failed");
 		goto done;
 	}
 	
-	ret = mc_alloc_align(nd, MC_LIFESPAN_LOCAL, pnio->ring_size * sizeof(union udma_desc), 0, MEM_LOC_HOST, 0, 0, 0, NEURON_MEMALLOC_TYPE_MISC_HOST, &pnio->rx_mc);
+	ret = mc_alloc_align(nd, MC_LIFESPAN_LOCAL, pnio->ring_size * sizeof(union udma_desc), 0, MEM_LOC_HOST, 0, 0, NEURON_MEMALLOC_TYPE_MISC_HOST, &pnio->rx_mc);
 	if (ret) {
 		pr_err("ultraserver election io memory allocation failed");
 		goto done;
 	}
 	
-	ret = mc_alloc_align(nd, MC_LIFESPAN_LOCAL, pnio->data_size, 0, MEM_LOC_HOST, 0, 0, 0, NEURON_MEMALLOC_TYPE_MISC_HOST, &pnio->data_mc);
+	ret = mc_alloc_align(nd, MC_LIFESPAN_LOCAL, pnio->data_size, 0, MEM_LOC_HOST, 0, 0, NEURON_MEMALLOC_TYPE_MISC_HOST, &pnio->data_mc);
 	if (ret) {
 		pr_err("ultraserver election io memory allocation failed");
 		goto done;
@@ -1130,7 +1130,8 @@ static void npe_initiate_election(u64  nbr_data_read_timeout)
 static bool npe_all_rst_complete(void)
 {
 	int i;
-	for (i=0; i < 16; i++) {
+	int device_count = (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_MAX) ? 4 : 16;
+	for (i = 0; i < device_count; i++) {
 		if (ndhal_pelect_data.pnd[i] == NULL) {
 			return false;
 		}
@@ -1212,6 +1213,7 @@ int npe_election_exec_on_rst(struct neuron_device *nd, bool reset_successful)
 	//
 	if ((ndhal_pelect_data.pod_state_internal != NEURON_NPE_POD_ST_INIT) ||
         (ndhal->ndhal_arch.platform_type != NEURON_PLATFORM_TYPE_PDS &&
+         ndhal->ndhal_arch.platform_type != NEURON_PLATFORM_TYPE_MAX &&
          npe_pod_ctl_is_set(NPE_POD_CTL_RST_SKIP_ELECTION))) {
 		goto done;
 	}
@@ -1222,9 +1224,8 @@ int npe_election_exec_on_rst(struct neuron_device *nd, bool reset_successful)
 			goto done;
 	}
 	
-	// initialize PDS configuration (topology/election) data
-	//
-	if (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_PDS) {
+	if (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_PDS ||
+	    ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_MAX) {
 		npe_pds_config_init();
 		goto done;
 	}
@@ -1278,8 +1279,9 @@ static int npe_get_modal_node_id(enum neuron_ultraserver_mode mode)
 {
 	int node_id = ndhal_pelect_data.node_id;
 
-	// PDS doesn't change node_id based on mode because nodes id are location based vs. election based
-	if (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_PDS) {
+	// PDS/MAX doesn't change node_id based on mode because nodes id are location based vs. election based
+	if (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_PDS ||
+	    ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_MAX) {
 		return node_id;
 	}
 
@@ -1620,8 +1622,9 @@ int npe_pod_ctrl(struct neuron_device *nd, u32 ctrl, enum neuron_ultraserver_mod
 	} else if (ctrl == NEURON_NPE_POD_CTRL_REQ_POD) {
 		int mark_cnt = ncrwl_range_mark_cnt_get();
 
-		// no election required on PDS, return success
-		if (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_PDS) {
+		// no election required on PDS/MAX, return success
+		if (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_PDS ||
+		    ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_MAX) {
 			ret = 0;
 			goto done;
 		}
@@ -1657,7 +1660,8 @@ done:
  */
 int npe_platform_ready(struct neuron_device *nd, enum neuron_platform_operation_type platform_operation)
 {
-	if (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_PDS) {
+	if (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_PDS ||
+	    ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_MAX) {
 		switch (platform_operation) {
 			case NEURON_PLATFORM_OP_TYPE_DEVOPEN:
 				if (npe_pod_state_busy()) { 
@@ -1810,7 +1814,8 @@ ssize_t npe_class_node_id_show_data(char *buf, u32 sz)
 		return dhal_sysfs_emit(buf, "busy\n");
 	}
 
-	if (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_PDS) {
+	if (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_PDS ||
+	    ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_MAX) {
 		mode = npe_node_cnt_to_mode(ndhal_pelect_data.node_cnt);
 	} else if (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_ULTRASERVER) {
 		mode = npe_node_cnt_to_mode(sz);
@@ -1825,9 +1830,10 @@ ssize_t npe_class_node_id_show_data(char *buf, u32 sz)
 
 ssize_t npe_class_node_cnt_show_data(char *buf)
 {
-	int node_cnt = -1; // node_cnt is currently only returned for PDS
+	int node_cnt = -1; // node_cnt is currently only returned for PDS/MAX
 
-	if (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_PDS) {
+	if (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_PDS ||
+	    ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_MAX) {
 		node_cnt = ndhal_pelect_data.node_cnt;
 	}
 
@@ -1849,7 +1855,8 @@ ssize_t npe_class_server_id_show_data(char *buf, u32 sz)
 		return dhal_sysfs_emit(buf, "0000000000000000\n");
 	}
 
-	if (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_PDS) {
+	if (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_PDS ||
+	    ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_MAX) {
 		mode = npe_node_cnt_to_mode(ndhal_pelect_data.node_cnt);
 	} else if (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_ULTRASERVER) {
 		mode = npe_node_cnt_to_mode(sz);
@@ -1911,7 +1918,7 @@ struct {
  *    - node_cnt       - count of nodes in the PDS server
  *
  */
-static void npe_pds_config_init(void)
+void npe_pds_config_init(void)
 {
 	static bool initialized = false;
 	int ret = 0;
@@ -1927,8 +1934,6 @@ static void npe_pds_config_init(void)
 		return;
 	}
 
-	// first check the mapping table to see if there's a match for preview server
-	//
 	nd = ndhal_pelect_data.pnd[0];
 	if (nd == NULL) {
 		pr_err("internal error.  Neuron device pointer should not be null at start of election");
@@ -1962,8 +1967,9 @@ static void npe_pds_config_init(void)
 	} 
 
 	if ((partition_sz == -1) || (instance_sz <= 0)) {
-		pr_warn("PDS partition/instance size data is invalid (%d/%d), defaulting to 4 node PDS configuration", partition_sz,  instance_sz);
-		ndhal_pelect_data.node_cnt = 4;
+		int default_node_cnt = (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_MAX) ? 1 : 4;
+		pr_warn("partition/instance size data is invalid (%d/%d), defaulting to %d node configuration", partition_sz, instance_sz, default_node_cnt);
+		ndhal_pelect_data.node_cnt = default_node_cnt;
 	} else {
 		ndhal_pelect_data.node_cnt = partition_sz / instance_sz;
 	}

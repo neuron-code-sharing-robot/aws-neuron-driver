@@ -16,8 +16,8 @@
 struct neuron_ioctl_mem_alloc {
 	__u64 size; // [in] Allocation size
 	__u32 host_memory; // [in] If true allocates from host memory; else allocates from device memory
-	__u32 dram_channel; // [in] DRAM channel in device memory
-	__u32 dram_region; // [in] DRAM region in device memory
+	__u32 hbm_index;   // [in] HBM index within a device
+	__u32 dram_region_unused;
 	__u32 nc_id; // [in] NeuronCore id(valid only if location is device)
 	__u64 *mem_handle; // [out] Allocated memory handle would stored here.
 };
@@ -26,8 +26,8 @@ struct neuron_ioctl_mem_alloc_v2 {
 	__u64 size; // [in] Allocation size
 	__u64 align; // [in] alignment
 	__u32 host_memory; // [in] If true allocates from host memory; else allocates from device memory
-	__u32 dram_channel; // [in] DRAM channel in device memory
-	__u32 dram_region; // [in] DRAM region in device memory
+	__u32 hbm_index;   // [in] HBM index within a device
+	__u32 dram_region_unused;
 	__u32 nc_id; // [in] NeuronCore id(valid only if location is device)
 	__u64 *mem_handle; // [out] Allocated memory handle would stored here.
 };
@@ -36,8 +36,8 @@ struct neuron_ioctl_mem_alloc_v2_mem_type {
 	__u64 size; // [in] Allocation size
 	__u64 align; // [in] alignment
 	__u32 host_memory; // [in] If true allocates from host memory; else allocates from device memory
-	__u32 dram_channel; // [in] DRAM channel in device memory
-	__u32 dram_region; // [in] DRAM region in device memory
+	__u32 hbm_index;   // [in] HBM index within a device
+	__u32 dram_region_unused;
 	__u32 nc_id; // [in] NeuronCore id(valid only if location is device)
 	__u32 mem_type; // [in] type of allocation
 	__u64 *mem_handle; // [out] Allocated memory handle would stored here.
@@ -53,8 +53,8 @@ struct neuron_ioctl_mem_alloc_v2_mem_type64 {
 	__u64 size; // [in] Allocation size
 	__u64 align; // [in] alignment
 	__u32 host_memory; // [in] If true allocates from host memory; else allocates from device memory
-	__u32 dram_channel; // [in] DRAM channel in device memory
-	__u32 dram_region; // [in] DRAM region in device memory
+	__u32 hbm_index;   // [in] HBM index within a device
+	__u32 dram_region_unused;
 	__u32 nc_id; // [in] NeuronCore id(valid only if location is device)
 	__u32 mem_type; // [in] type of allocation
 	__u64 *mem_handle; // [out] Allocated memory handle would stored here.
@@ -70,8 +70,8 @@ struct neuron_ioctl_mem_alloc_v2_mem_type64_pa {
 	__u64 size; // [in] Allocation size
 	__u64 align; // [in] alignment
 	__u32 host_memory; // [in] If true allocates from host memory; else allocates from device memory
-	__u32 dram_channel; // [in] DRAM channel in device memory
-	__u32 dram_region; // [in] DRAM region in device memory
+	__u32 hbm_index;   // [in] HBM index within a device
+	__u32 dram_region_unused;
 	__u32 nc_id; // [in] NeuronCore id(valid only if location is device)
 	__u32 mem_type; // [in] type of allocation
 	__u64 *mem_handle; // [out] Allocated memory handle would stored here.
@@ -212,7 +212,21 @@ struct neuron_ioctl_mem_buf_copy64zc {
 	__u32 is_copy_to_device; // [in] if set to True copies to device
 	__u32 bar4_wr_threshold; // [in] threshold below which we will use bar4 direct write vs. DMA. Subject to driver limits.
 	__s32 h2t_qid; // [in] h2t queue to use for the transfer.  -1 = use default
-	__u32 dummy;  // [na] pad to change size of struct to version ioctl
+	__u32 dummy; // [in] Explicit padding for 64-bit alignment.
+	__u64 sequence_num; // [in] The sequence number that uniquely identifies each async I/O.
+	void *context; // [in] Opaque context pointer passed back and representing a pointer to xu_error_list_t in runtime.
+};
+
+// Old drivers use the same zerocopy ioctl number with this smaller payload.
+struct neuron_ioctl_mem_buf_copy64zc_deprecated {
+	__u64 mem_handle; // [in] Source or Destination memory handle from/to data needs to be copied.
+	void *buffer; // [in] Buffer from/to where data to be copied.
+	__u64 size; // [in] Size of the data to be copied.
+	__u64 offset; // [in] Offset in the memory handle where the data to be written/read.
+	__u32 is_copy_to_device; // [in] if set to True copies to device
+	__u32 bar4_wr_threshold; // [in] threshold below which we will use bar4 direct write vs. DMA. Subject to driver limits.
+	__s32 h2t_qid; // [in] h2t queue to use for the transfer.  -1 = use default
+	__u32 dummy; // [in] Explicit padding for 64-bit alignment.
 };
 
 struct neuron_ioctl_mem_buf_copy64zc_batches {
@@ -375,8 +389,8 @@ struct neuron_ioctl_notifications_init_v2 {
 	__u32 engine_index; // [in] Engine Index.
 	__u32 size; // [in] Notification queue size in bytes
 	__u32 on_host_memory; // [in] If true allocates NQ in host memory; else allocates in device memory
-	__u32 dram_channel; // [in] DRAM channel in device memory
-	__u32 dram_region; // [in] DRAM region in device memory
+	__u32 hbm_index;   // [in] HBM index within a device
+	__u32 dram_region_unused;
 	__u64 mmap_offset; // [out] mmap() offset for this NQ
 	__u64 mem_handle; // [out] mem_handle for this NQ
 };
@@ -388,8 +402,8 @@ struct neuron_ioctl_notifications_init_with_realloc_v2 {
 	__u32 engine_index; // [in] Engine Index.
 	__u32 size; // [in] Notification queue size in bytes
 	__u32 on_host_memory; // [in] If true allocates NQ in host memory; else allocates in device memory
-	__u32 dram_channel; // [in] DRAM channel in device memory
-	__u32 dram_region; // [in] DRAM region in device memory
+	__u32 hbm_index;   // [in] HBM index within a device
+	__u32 dram_region_unused;
 	__u32 force_alloc_mem; // If true force allocates new memory (and deletes already allocated memory, if any)
 	__u64 mmap_offset; // [out] mmap() offset for this NQ
 	__u64 mem_handle; // [out] mem_handle for this NQ
@@ -507,6 +521,13 @@ struct neuron_ioctl_dmabuf_fd {
 	__u64 va;
 	__u64 size;
 	__s32 *fd;
+};
+
+struct neuron_ioctl_dmabuf_fd_v2 {
+	__u64 va;
+	__u64 size;
+	__s32 *fd;
+	__u64 *offset;
 };
 
 #define NEURON_DEVICE_DRIVER_INFO_VERSION0  0
@@ -882,6 +903,7 @@ struct neuron_ioctl_host_mem_unpin {
 #define NEURON_IOCTL_POD_CTRL _IOWR(NEURON_IOCTL_BASE, 123, struct neuron_ioctl_pod_ctrl)
 #define NEURON_IOCTL_POD_CTRL_V2 _IOWR(NEURON_IOCTL_BASE, 123, struct neuron_ioctl_pod_ctrl_v2)
 
+#define NEURON_IOCTL_MEM_BUF_ZEROCOPY64_DEPRECATED _IOWR(NEURON_IOCTL_BASE, 124, struct neuron_ioctl_mem_buf_copy64zc_deprecated)
 #define NEURON_IOCTL_MEM_BUF_ZEROCOPY64 _IOWR(NEURON_IOCTL_BASE, 124, struct neuron_ioctl_mem_buf_copy64zc)
 
 #define NEURON_IOCTL_H2T_DMA_ALLOC_QUEUES _IOWR(NEURON_IOCTL_BASE, 125, struct neuron_ioctl_h2t_dma_alloc_queues)
@@ -909,5 +931,8 @@ struct neuron_ioctl_host_mem_unpin {
 /** Pre-pinned host memory operations - zerocopy will auto-detect pinned memory */
 #define NEURON_IOCTL_HOST_MEM_PIN _IOWR(NEURON_IOCTL_BASE, 136, struct neuron_ioctl_host_mem_pin)
 #define NEURON_IOCTL_HOST_MEM_UNPIN _IOW(NEURON_IOCTL_BASE, 137, struct neuron_ioctl_host_mem_unpin)
+
+/** Get dma-buf file-descriptor with offset (v2) */
+#define NEURON_IOCTL_DMABUF_FD_V2 _IOR(NEURON_IOCTL_BASE, 138, struct neuron_ioctl_dmabuf_fd_v2 *)
 
 #endif

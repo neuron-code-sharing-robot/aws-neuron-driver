@@ -127,14 +127,13 @@ static void mc_remove_node(struct rb_root *root, struct mem_chunk *mc)
  * @start_addr: starting address of the pool
  * @pool_size: size of the pool.
  * @mem_location: location of the backing memory.
- * @dram_channel: device dram channel backing this pool.
- * @dram_region: device dram region backing this pool.
+ * @hbm_index: device hbm index backing this pool.
  *
  * Return: 0 if pool is created, a negative error code otherwise.
  */
 
 static int mp_init_device_mem(struct neuron_mempool *mp, struct neuron_mempool_set *mpset,
-			      u64 start_addr, size_t pool_size,	u32 dram_channel, u32 dram_region)
+			      u64 start_addr, size_t pool_size,	u32 hbm_index)
 {
 	int ret;
 	ulong small_pool_size = mempool_small_pool_size;
@@ -162,8 +161,7 @@ static int mp_init_device_mem(struct neuron_mempool *mp, struct neuron_mempool_s
 
 	mp->mpset = mpset;
 	mp->mem_location = MEM_LOC_DEVICE;
-	mp->dram_channel = dram_channel;
-	mp->dram_region = dram_region;
+	mp->hbm_index = hbm_index;
 	mp->main_pool_end_addr = start_addr + main_pool_size;
 	mp->small_pool_size = small_pool_size;
 
@@ -194,7 +192,7 @@ static int mp_init_device_mem(struct neuron_mempool *mp, struct neuron_mempool_s
 		mp->gen_pool_small = NULL;
 	}
 
-	snprintf(mp->name, sizeof(mp->name), "device mempool [%d:%d]", dram_channel, dram_region);
+	snprintf(mp->name, sizeof(mp->name), "device mempool [%d]", hbm_index);
 	mp->region_size = pool_size;
 	mp->initialized = 1;
 
@@ -329,8 +327,7 @@ static void mp_destroy_gen_pool(struct neuron_mempool *mp)
 static int mpset_block_carveout_regions(struct neuron_device *nd, struct neuron_mempool_set *mpset, u64 *device_dram_addr, u64 *device_dram_size)
 {
 	int ret;
-	u64 region_sz;
-	int channel = 0, region = 0;
+	int hbm_index = 0;
 
 	/*
 	*  Block carve out regions: Upper 16 MB is used internally by firmware
@@ -344,24 +341,21 @@ static int mpset_block_carveout_regions(struct neuron_device *nd, struct neuron_
 	*
 	*     lib/genalloc.c: fix allocation of aligned buffer from non-aligned chunk
 	*/
-	for (channel = 0; channel < mpset->num_channels; channel++) {
-		region_sz = device_dram_size[channel] / mpset->mp_device_num_regions;
-		for (region = 0; region < mpset->mp_device_num_regions; region++) {
-			const dma_addr_t start_addr = device_dram_addr[channel] + (region * region_sz);
-			struct mem_chunk *mc = NULL;
-			u32 nc_id = channel;
-			ret = mc_alloc_align(nd, MC_LIFESPAN_DEVICE, MEMPOOL_CARVEOUT_SIZE, 0, MEM_LOC_DEVICE, channel, region, nc_id, NEURON_MEMALLOC_TYPE_NCDEV_DEVICE, &mc);
-			if (ret) {
-				pr_err("failed to allocate hbm carveout region: ret=%d\n", ret);
-				return -ENOMEM;
-			}
-			if (mc->pa != start_addr) {
-				pr_err("carve out mc not offset 0!");
-				mc_free(&mc);
-				return -EINVAL;
-			}
+	for (hbm_index = 0; hbm_index < mpset->num_hbms; hbm_index++) {
+		const dma_addr_t start_addr = device_dram_addr[hbm_index];
+		struct mem_chunk *mc = NULL;
+		u32 nc_id = hbm_index; // TODO is this right?
+		ret = mc_alloc_align(nd, MC_LIFESPAN_DEVICE, MEMPOOL_CARVEOUT_SIZE, 0, MEM_LOC_DEVICE, hbm_index, nc_id, NEURON_MEMALLOC_TYPE_NCDEV_DEVICE, &mc);
+		if (ret) {
+			pr_err("failed to allocate hbm carveout: ret=%d\n", ret);
+			return -ENOMEM;
 		}
-		ndhal->ndhal_mpset.device_dram_effective_base_addr[channel] = device_dram_addr[channel] + MEMPOOL_CARVEOUT_SIZE;
+		if (mc->pa != start_addr) {
+			pr_err("carve out mc not offset 0!");
+			mc_free(&mc);
+			return -EINVAL;
+		}
+		ndhal->ndhal_mpset.device_dram_effective_base_addr[hbm_index] = device_dram_addr[hbm_index] + MEMPOOL_CARVEOUT_SIZE;
 	}
 
 	return 0;
@@ -378,22 +372,19 @@ static int mpset_block_carveout_regions(struct neuron_device *nd, struct neuron_
 static int mpset_init_device_pools(struct neuron_mempool_set *mpset, struct neuron_device *nd)
 {
 	int ret;
-	int channel = 0, region = 0;
-	u64 region_sz = 0;
-	u64 device_dram_addr[MAX_DRAM_CHANNELS];
-	u64 device_dram_size[MAX_DRAM_CHANNELS];
+	int hbm_index = 0;
+	u64 device_dram_addr[MAX_NUM_HBMS];
+	u64 device_dram_size[MAX_NUM_HBMS];
 
 	ndhal->ndhal_mpset.mpset_set_dram_and_mpset_info(mpset, device_dram_addr, device_dram_size);
 
-	for (channel = 0; channel < mpset->num_channels; channel++) {
-		region_sz = device_dram_size[channel] / mpset->mp_device_num_regions;
-		for (region = 0; region < mpset->mp_device_num_regions; region++) {
-			dma_addr_t addr = device_dram_addr[channel] + (region * region_sz);
-			ret = mp_init_device_mem(&mpset->mp_device[channel][region], mpset, addr, region_sz, channel, region);
-			if (ret) {
-				pr_err("mpset device init failed %d\n", ret);
-				goto fail;
-			}
+	for (hbm_index = 0; hbm_index < mpset->num_hbms; hbm_index++) {
+		dma_addr_t addr = device_dram_addr[hbm_index];
+		u64 sz = device_dram_size[hbm_index];
+		ret = mp_init_device_mem(&mpset->mp_device[hbm_index], mpset, addr, sz, hbm_index);
+		if (ret) {
+			pr_err("mpset device init failed %d\n", ret);
+			goto fail;
 		}
 	}
 
@@ -405,10 +396,8 @@ static int mpset_init_device_pools(struct neuron_mempool_set *mpset, struct neur
 	return 0;
 
 fail:
-	for (; channel >= 0; channel--) {
-		for (; region >= 0; region--) {
-			mp_destroy_gen_pool(&mpset->mp_device[channel][region]);
-		}
+	for (hbm_index--; hbm_index >= 0; hbm_index--) {
+		mp_destroy_gen_pool(&mpset->mp_device[hbm_index]);
 	}
 	memset(mpset, 0, sizeof(struct neuron_mempool_set));
 
@@ -498,7 +487,7 @@ static struct list_head * mpset_get_lifespan_head(struct neuron_mempool_set *mps
 
 void mpset_destructor(struct neuron_mempool_set *mpset)
 {
-	int i, channel, region;
+	int i, hbm_index;
 	struct list_head *head;
 	struct neuron_device *nd;
 
@@ -521,10 +510,8 @@ void mpset_destructor(struct neuron_mempool_set *mpset)
 		mp_destroy_gen_pool(&mpset->mp_hrm[i]);
 	}
 
-	for (channel = 0; channel < mpset->num_channels; channel++) {
-		for (region = 0; region < mpset->mp_device_num_regions; region++) {
-			mp_destroy_gen_pool(&mpset->mp_device[channel][region]);
-		}
+	for (hbm_index = 0; hbm_index < mpset->num_hbms; hbm_index++) {
+		mp_destroy_gen_pool(&mpset->mp_device[hbm_index]);
 	}
 	mutex_unlock(&mpset->lock);
 }
@@ -629,7 +616,7 @@ static inline u64 get_offset_for_scratchpad_alloc(const struct neuron_mempool *m
 }
 
 static int mc_alloc_internal(struct neuron_device *nd, enum mc_lifespan lifespan, u64 size, u64 align,
-	     enum mem_location location, u32 channel, u32 region, u32 nc_id, mem_alloc_category_t mem_type,
+	     enum mem_location location, u32 hbm_index, u32 nc_id, mem_alloc_category_t mem_type,
 	     struct mem_chunk **result)
 {
 	struct mem_chunk *mc;
@@ -648,20 +635,13 @@ static int mc_alloc_internal(struct neuron_device *nd, enum mc_lifespan lifespan
 		return -EINVAL;
 	}
 	size = roundup(size, PAGE_SIZE);
-	if (channel >= ndhal->ndhal_address_map.dram_channels)
+	if (hbm_index >= ndhal->ndhal_address_map.num_hbms)
 		return -EINVAL;
 #ifdef CONFIG_FAULT_INJECTION
 	if (should_fail(&neuron_fail_mc_alloc, 1))
 		return -ENOMEM;
 #endif
 	if (nc_id >= MAX_NC_PER_DEVICE) {
-		return -EINVAL;
-	}
-
-	if (mpset->mp_device_num_regions == 1) // shared DRAM mode, always use region 0
-		region = 0;
-
-	if (region >= mpset->mp_device_num_regions) {
 		return -EINVAL;
 	}
 
@@ -708,7 +688,7 @@ static int mc_alloc_internal(struct neuron_device *nd, enum mc_lifespan lifespan
 		else
 			pr_info("host mem occupied %lld\n", mpset->host_mem_size);
 	} else {
-		mp = &mpset->mp_device[channel][region];
+		mp = &mpset->mp_device[hbm_index];
 		if (!mp->gen_pool) {
 			pr_err("mempool not initialized\n");
 			ret = -ENOMEM;
@@ -730,7 +710,7 @@ static int mc_alloc_internal(struct neuron_device *nd, enum mc_lifespan lifespan
 			mc->va = (void *)gen_pool_alloc_algo(pool, size,
 						     gen_pool_fixed_alloc, &offset_data);
 			if (mc->va == NULL) {
-				pr_err("nd %d HBM %d: Could not allocate %lld bytes at offset %ld for contiguous scratchpad\n", nd->device_index, channel, size, offset_data.offset);
+				pr_err("nd %d HBM %d: Could not allocate %lld bytes at offset %ld for contiguous scratchpad\n", nd->device_index, hbm_index, size, offset_data.offset);
 				ret = -ENOMEM;
 				goto exit;
 			}
@@ -750,7 +730,7 @@ static int mc_alloc_internal(struct neuron_device *nd, enum mc_lifespan lifespan
 			if (mc->va == NULL && alt_pool != NULL) {
 				bool pool_is_main = (pool == mp->gen_pool);
 				pr_warn_once("no space in %s genpool for HBM %d, needed %lld (alignment %lld), trying %s genpool\n", pool_is_main ? "main":"small",
-					channel, size, align, pool_is_main ? "small":"main");
+					hbm_index, size, align, pool_is_main ? "small":"main");
 				mc->va = (void *)gen_pool_alloc_algo(alt_pool, size,
 							     gen_pool_first_fit_align, &align_data);
 				mc->gen_pool = alt_pool;
@@ -771,7 +751,7 @@ static int mc_alloc_internal(struct neuron_device *nd, enum mc_lifespan lifespan
 			if (mc->va == NULL && alt_pool != NULL) {
 				bool pool_is_main = (pool == mp->gen_pool);
 				pr_warn_once("no space in %s genpool for HBM %d, needed %lld, trying %s genpool\n", pool_is_main ? "main":"small",
-					channel, size, pool_is_main ? "small":"main");
+					hbm_index, size, pool_is_main ? "small":"main");
 				mc->va = gen_pool_dma_alloc(alt_pool, size, &mc->pa);
 				mc->gen_pool = alt_pool;
 			} else {
@@ -788,8 +768,6 @@ static int mc_alloc_internal(struct neuron_device *nd, enum mc_lifespan lifespan
 				pr_info("%s total %ld occupied %ld needed %lld available - main gen pool %ld, small gen pool %ld\n", mp->name,
 					mp->region_size, mp->allocated_size, size, gen_pool_avail(mp->gen_pool), gen_pool_avail(mp->gen_pool_small));
 			}
-			pr_info("device regions %d occupied %lld\n", mpset->mp_device_num_regions,
-				mpset->device_mem_size);
 		}
 	}
 	if (mc->va == NULL) {
@@ -803,8 +781,7 @@ static int mc_alloc_internal(struct neuron_device *nd, enum mc_lifespan lifespan
 	mc->size = size;
 	mc->mc_handle = NMCH_INVALID_HANDLE;
 	mc->mem_location = location;
-	mc->dram_channel = channel;
-	mc->dram_region = region;
+	mc->hbm_index = hbm_index;
 	mc->nc_id = nc_id;
 	mc->pid = task_tgid_nr(current);
 	mc->ref_count = 1;
@@ -844,9 +821,9 @@ exit:
 }
 
 int mc_alloc_align(struct neuron_device *nd, enum mc_lifespan lifespan, u64 size, u64 align,
-		   enum mem_location location, u32 channel, u32 region, u32 nc_id, mem_alloc_category_t mem_type,
+		   enum mem_location location, u32 hbm_index, u32 nc_id, mem_alloc_category_t mem_type,
 		   struct mem_chunk **result) {
-	return mc_alloc_internal(nd, lifespan, size, align, location, channel, region, nc_id, mem_type, result);
+	return mc_alloc_internal(nd, lifespan, size, align, location, hbm_index, nc_id, mem_type, result);
 };
 
 void mc_inc_refcount(struct mem_chunk *mc)
@@ -898,7 +875,7 @@ void mc_free(struct mem_chunk **mcp)
 		nsysfsmetric_dec_counter(mpset->nd, NON_NDS_METRIC, NON_NDS_COUNTER_HOST_MEM, mc->nc_id, mc->size, false);
 	} else if (mc->mem_location == MEM_LOC_DEVICE) {
 		struct neuron_mempool *mp;
-		mp = &mpset->mp_device[mc->dram_channel][mc->dram_region];
+		mp = &mpset->mp_device[mc->hbm_index];
 		gen_pool_free(mc->gen_pool, (u64)mc->va, mc->size);
 		mp->allocated_size -= mc->size;
 		mpset->device_mem_size -= mc->size;
@@ -928,7 +905,7 @@ void mc_free(struct mem_chunk **mcp)
 	kfree(mc);
 }
 
-int mc_dump_all_chunks(struct neuron_device *nd, u32 channel, u32 num_entries_in, struct neuron_ioctl_mem_chunk_info *data, u32 *num_entries_out)
+int mc_dump_all_chunks(struct neuron_device *nd, u32 hbm_index, u32 num_entries_in, struct neuron_ioctl_mem_chunk_info *data, u32 *num_entries_out)
 {
 	struct neuron_mempool_set *mpset = &nd->mpset;
 	u32 cnt = 0;
@@ -937,7 +914,7 @@ int mc_dump_all_chunks(struct neuron_device *nd, u32 channel, u32 num_entries_in
 	read_lock(&mpset->rblock);
 	for (node = rb_first(&mpset->root); node; node = rb_next(node)) {
 		struct mem_chunk *mc = rb_entry(node, struct mem_chunk, node);
-		if (mc->mem_location == MEM_LOC_DEVICE && mc->dram_channel == channel) {
+		if (mc->mem_location == MEM_LOC_DEVICE && mc->hbm_index == hbm_index) {
 			if (cnt < num_entries_in) {
 				struct neuron_ioctl_mem_chunk_info *i = &data[cnt];
 				i->pa = mc->pa;

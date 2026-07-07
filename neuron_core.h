@@ -86,8 +86,6 @@ int nc_event_set(struct neuron_device *nd, u8 nc_id, u16 event_index, u32 value)
 #define MAX_NQ_TYPE 6  //for v1 4 and v2 6
 #define MAX_NQ_ENGINE 16 // for v1 4 engines for v2 16 queues
 
-#define MAX_NQ_SUPPORTED (MAX_NQ_TYPE * MAX_NQ_ENGINE)
-
 /**
  * nc_get_nq_mem_handle() - Get notification queue's mem handle for given neuron core.
  *

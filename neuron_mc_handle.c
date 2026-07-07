@@ -129,6 +129,15 @@ int nmch_handle_alloc(struct neuron_device *nd, struct mem_chunk *mc, neuron_mc_
 
 	mutex_lock(&nd->nmch.lock);
 
+	// if a handle has already been allocated for this mc (possibly by a
+	// concurrent caller that won the race), return it instead of allocating
+	// a second handle that would never be freed.
+	if (mc->mc_handle != NMCH_INVALID_HANDLE) {
+		*mc_handle = mc->mc_handle;
+		ret = 0;
+		goto done;
+	}
+
 	if (nmch_service_is_down(nd)) {
 		ret = -ENOENT;
 		goto done;

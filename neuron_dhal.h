@@ -48,7 +48,8 @@ struct ndhal_address_map {
 	int dma_eng_per_nc;
 	int seng_dma_eng_per_nd;
     int h2d_dma_eng_per_nd;
-	int dram_channels;
+	int num_hbms;
+	u16 nq_per_nc;
 };
 
 struct ndhal_reset {
@@ -62,7 +63,7 @@ struct ndhal_reset {
 
 struct ndhal_topsp {
     int (*ts_nq_init) (struct neuron_device *nd, u8 ts_id, u8 eng_index, u32 nq_type, u32 size,
-                       u32 on_host_memory, u32 dram_channel, u32 dram_region,
+                       u32 on_host_memory, u32 hbm_index,
                        bool force_alloc_mem, struct mem_chunk **nq_mc, u64 *mmap_offset);
     void (*ts_nq_destroy_one) (struct neuron_device *nd, u8 ts_id);
 	u8 (*ts_nq_get_nqid)(struct neuron_device *nd, u8 index, u32 nq_type);
@@ -81,8 +82,8 @@ struct ndhal_nq {
 
 struct ndhal_mpset {
     int mp_min_alloc_size;
-    u64 device_dram_effective_base_addr[MAX_DRAM_CHANNELS];
-    u64 device_dram_end_addr[MAX_DRAM_CHANNELS];
+    u64 device_dram_effective_base_addr[MAX_NUM_HBMS];
+    u64 device_dram_end_addr[MAX_NUM_HBMS];
     bool small_pool_supported;
     void (*mpset_set_dram_and_mpset_info) (struct neuron_mempool_set *mpset, u64 *device_dram_addr, u64 *device_dram_size);
 };

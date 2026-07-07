@@ -56,7 +56,7 @@
 #define V2_TS_PER_DEVICE 6
 
 // max channels supported by v2 device
-#define V2_MAX_DRAM_CHANNELS 2  //2 HBM's.
+#define V2_NUM_HBMS 2  //2 HBM's.
 #define V2_MAX_DDR_REGIONS V2_NC_PER_DEVICE
 
 #define V2_SEMAPHORE_COUNT 256

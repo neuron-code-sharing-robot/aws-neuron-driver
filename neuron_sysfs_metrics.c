@@ -185,6 +185,7 @@ static const int root_arch_node_attrs_info_tbl_cnt = sizeof(root_arch_node_attrs
 
 static const nsysfsmetric_attr_info_t power_utilization_attrs_info_tbl[] = {
 	ATTR_INFO("utilization", NON_NDS_ID_TO_SYSFS_METRIC_ID(NON_NDS_OTHER_POWER_UTILIZATION), OTHER),
+	ATTR_INFO("utilization_raw", NON_NDS_ID_TO_SYSFS_METRIC_ID(NON_NDS_OTHER_POWER_UTILIZATION_RAW), OTHER),
 };
 static const int power_utilization_attrs_info_tbl_cnt = sizeof(power_utilization_attrs_info_tbl) / sizeof(nsysfsmetric_attr_info_t);
 
@@ -409,6 +410,15 @@ static ssize_t nsysfsmetric_show_nrt_other_metrics(struct nsysfsmetric_metrics *
 			pr_err("sysfs failed to read power stats from FWIO, error = %d", ret);
 		}
 		len = nsysfsmetric_sysfs_emit(buf, "%s\n", buffer);
+	} else if (attr->metric_id == NON_NDS_ID_TO_SYSFS_METRIC_ID(NON_NDS_OTHER_POWER_UTILIZATION_RAW)) {
+		struct neuron_device *nd = container_of(sysfs_metrics, struct neuron_device, sysfs_metrics);
+
+		char buffer[256];
+		int ret = npower_format_raw(nd, buffer, sizeof(buffer));
+		if (ret) {
+			pr_err("sysfs failed to read raw power from FWIO, error = %d", ret);
+		}
+		len = nsysfsmetric_sysfs_emit(buf, "%s", buffer);
 	} else if (attr->metric_id == NON_NDS_ID_TO_SYSFS_METRIC_ID(NON_NDS_COUNTER_PE_ARRAY_ACTIVITY)) {
         struct neuron_device *nd = container_of(sysfs_metrics, struct neuron_device, sysfs_metrics);
 

@@ -47,7 +47,7 @@ int ts_nq_destroy(struct neuron_device *nd, u8 ts_id, u8 eng_index, u32 nq_type)
 		return -EINVAL;
 
 	nq_id = ndhal->ndhal_topsp.ts_nq_get_nqid(nd, eng_index, nq_type);
-	if (nq_id >= MAX_NQ_SUPPORTED)
+	if (nq_id >= ndhal->ndhal_address_map.nq_per_nc)
 		return -EINVAL;
 
 	if (nd->ts_nq_mc[ts_id][nq_id] == NULL)

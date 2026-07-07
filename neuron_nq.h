@@ -53,6 +53,23 @@ static inline void notific_write_nq_f_size(void __iomem *base, size_t index,
 #define NOTIFIC_NQ_HEAD_OFFSET 0x10c
 
 /**
+ * nnq_init_storage() - Allocate the per-NC and per-TS notification queue
+ *                      tracking arrays
+ *
+ * @nd: neuron device
+ *
+ */
+int nnq_init_storage(struct neuron_device *nd);
+
+/**
+ * nnq_destroy_storage() - Free the per-NC and per-TS notification queue
+ *                         tracking arrays
+ *
+ * @nd: neuron device
+ */
+void nnq_destroy_storage(struct neuron_device *nd);
+
+/**
  * nnq_init() - Initialize notification queue for NeuronCore
  *
  * @nd: neuron device
@@ -61,8 +78,7 @@ static inline void notific_write_nq_f_size(void __iomem *base, size_t index,
  * @nq_type: type of the notification queue
  * @size: size of queue in bytes
  * @on_host_memory: if true, NQ is created in host memory
- * @dram_channel: If NQ is created on device memory which DRAM channel to use.
- * @dram_region: If NQ is created on device memory which DRAM region to use.
+ * @hbm_index: If NQ is created on device memory which DRAM channel to use.
  * @force_alloc_mem: If true, force allocate new memory (and delete already allocated memory, if any)
  * @nq_mc[out]: memchunk used by the NQ will be written here
  * @mc_ptr[out]: Pointer to memchunk backing this NQ
@@ -70,7 +86,7 @@ static inline void notific_write_nq_f_size(void __iomem *base, size_t index,
  * Return: 0 on if initialization succeeds, a negative error code otherwise.
  */
 int nnq_init(struct neuron_device *nd, u8 nc_id, u8 eng_index, u32 nq_type, u32 size,
-	       u32 on_host_memory, u32 dram_channel, u32 dram_region,
+	       u32 on_host_memory, u32 hbm_index,
 	       bool force_alloc_mem, struct mem_chunk **nq_mc, u64 *mmap_offset);
 
 /**

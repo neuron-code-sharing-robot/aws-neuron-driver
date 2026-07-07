@@ -211,6 +211,7 @@ bool ndma_zerocopy_supported(void);
  * @qid: Queue identifier to submit descriptors on.
  * @direction: true for host-to-device, false for device-to-host.
  * @sequence_num: sequence number under async submission; 0 for sync.
+ * @context: opaque context pointer returned in the completion queue for async submissions.
  *
  *   DMA data between a user space virtual address range and a contiguous location in device memory.
  *   In order to do this, we need to know the physical pages are associated with
@@ -260,7 +261,8 @@ int ndma_zerocopy_submit(struct neuron_device *nd,
 						dma_addr_t dev_base,
 						int qid,
 						bool direction,
-						u64 sequence_num);
+						u64 sequence_num,
+						void *context);
 
 /**
  * Pre-pinned host memory support

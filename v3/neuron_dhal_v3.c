@@ -233,32 +233,22 @@ static int ndhal_register_funcs_trn2(void) {
 	return 0;
 }
 
-/* Instance names
- */
-#define NEURON_TRN2P_INSTANCE_NAME "trn2p.48xlarge"
-#define NEURON_TRN2EU_INSTANCE_NAME "trn2eu.48xlarge"
-#define NEURON_TRN2U_INSTANCE_NAME "trn2u.48xlarge"
-#define NEURON_TRN2UAC_INSTANCE_NAME "trn2u-ac.24xlarge"
-#define NEURON_TRN2PDS_INSTANCE_NAME "trn2es.48xlarge"
+static const struct neuron_platform_lookup v3_platform_map[] = {
+	{"trn2p.48xlarge",    NEURON_PLATFORM_TYPE_ULTRASERVER},
+	{"trn2eu.48xlarge",   NEURON_PLATFORM_TYPE_ULTRASERVER},
+	{"trn2u.48xlarge",    NEURON_PLATFORM_TYPE_ULTRASERVER},
+	{"trn2u-ac.24xlarge", NEURON_PLATFORM_TYPE_ULTRASERVER},
+	{"trn2es.48xlarge",   NEURON_PLATFORM_TYPE_PDS},
+	{"trn2en.24xlarge",   NEURON_PLATFORM_TYPE_MAX},
+	{NULL,                NEURON_PLATFORM_TYPE_INVALID},
+};
 
 static enum neuron_platform_type ndhal_platform_type_v3(void)
 {
-	enum neuron_platform_type platform_type = NEURON_PLATFORM_TYPE_INVALID;
-	char buf[128];
+	enum neuron_platform_type platform_type;
 
-	if (narch_get_instance_type_name(buf, sizeof(buf))) goto done;
-	if ((strncmp(buf, NEURON_TRN2P_INSTANCE_NAME, sizeof(NEURON_TRN2P_INSTANCE_NAME)-1) == 0) ||
-	    (strncmp(buf, NEURON_TRN2EU_INSTANCE_NAME, sizeof(NEURON_TRN2EU_INSTANCE_NAME)-1) == 0) ||
-	    (strncmp(buf, NEURON_TRN2U_INSTANCE_NAME, sizeof(NEURON_TRN2U_INSTANCE_NAME)-1) == 0) ||
-	    (strncmp(buf, NEURON_TRN2UAC_INSTANCE_NAME, sizeof(NEURON_TRN2UAC_INSTANCE_NAME)-1) == 0)) {
-		platform_type = NEURON_PLATFORM_TYPE_ULTRASERVER;
-	} else if ((strncmp(buf, NEURON_TRN2PDS_INSTANCE_NAME, sizeof(NEURON_TRN2PDS_INSTANCE_NAME)-1) == 0)) {
-		platform_type = NEURON_PLATFORM_TYPE_PDS;
-	} else {
-		platform_type = NEURON_PLATFORM_TYPE_STD;
-	}
+	platform_type = narch_detect_platform_type(v3_platform_map);
 
-done:
 	if (force_userver) {
 		platform_type = NEURON_PLATFORM_TYPE_ULTRASERVER;
 	}
@@ -506,8 +496,7 @@ static void ts_nq_set_hwaddr_v3(struct neuron_device *nd, u8 ts_id, u8 index, u3
  * @nq_type: type of the notification queue
  * @size: size of queue in bytes
  * @on_host_memory: if true, NQ is created in host memory
- * @dram_channel: If NQ is created on device memory which DRAM channel to use.
- * @dram_region: If NQ is created on device memory which DRAM region to use.
+ * @hbm_index: If NQ is created on device memory which HBM to use.
  * @force_alloc_mem: If true, force allocate new memory (and delete already allocated memory, if any)
  * @nq_mc[out]: memchunk used by the NQ will be written here
  * @mc_ptr[out]: Pointer to memchunk backing this NQ
@@ -515,7 +504,7 @@ static void ts_nq_set_hwaddr_v3(struct neuron_device *nd, u8 ts_id, u8 index, u3
  * Return: 0 on if initialization succeeds, a negative error code otherwise.
  */
 static int ts_nq_init_v3(struct neuron_device *nd, u8 ts_id, u8 eng_index, u32 nq_type, u32 size,
-				u32 on_host_memory, u32 dram_channel, u32 dram_region,
+				u32 on_host_memory, u32 hbm_index,
 				bool force_alloc_mem, struct mem_chunk **nq_mc, u64 *mmap_offset)
 {
 	// Check that size is power of 2
@@ -528,7 +517,7 @@ static int ts_nq_init_v3(struct neuron_device *nd, u8 ts_id, u8 eng_index, u32 n
 		return -EINVAL;
 
 	u8 nq_id = ts_nq_get_nqid_v3(nd, eng_index, nq_type);
-	if (nq_id >= MAX_NQ_SUPPORTED)
+	if (nq_id >= V3_MAX_NQ_SUPPORTED)
 		return -EINVAL;
 
 	struct mem_chunk *mc = nd->ts_nq_mc[ts_id][nq_id];
@@ -537,7 +526,7 @@ static int ts_nq_init_v3(struct neuron_device *nd, u8 ts_id, u8 eng_index, u32 n
 		u32 nc_id = ts_id / V3_TS_PER_NC;
 
 		int ret = mc_alloc_align(nd, MC_LIFESPAN_DEVICE, size, (on_host_memory) ? 0 : size, on_host_memory ? MEM_LOC_HOST : MEM_LOC_DEVICE,
-				   dram_channel, dram_region, nc_id, on_host_memory ? NEURON_MEMALLOC_TYPE_NOTIFICATION_HOST : NEURON_MEMALLOC_TYPE_NOTIFICATION_DEVICE, &_mc);
+				   hbm_index, nc_id, on_host_memory ? NEURON_MEMALLOC_TYPE_NOTIFICATION_HOST : NEURON_MEMALLOC_TYPE_NOTIFICATION_DEVICE, &_mc);
 		if (ret)
 			return ret;
 		ts_nq_set_hwaddr_v3(nd, ts_id, eng_index, nq_type, size, _mc->pa);
@@ -664,8 +653,7 @@ static void nnq_set_hwaddr_v3(struct neuron_device *nd, u8 nc_id, u8 index, u32 
  */
 static void mpset_set_dram_and_mpset_info_v3(struct neuron_mempool_set *mpset, u64 *device_dram_addr, u64 *device_dram_size)
 {
-	mpset->num_channels = V3_MAX_DRAM_CHANNELS;
-	mpset->mp_device_num_regions = 1;
+	mpset->num_hbms = V3_NUM_HBMS;
 	device_dram_addr[0] = V3_HBM_0_BASE;
 	device_dram_addr[1] = V3_HBM_1_BASE;
 	device_dram_addr[2] = V3_HBM_2_BASE;
@@ -697,7 +685,7 @@ static void mpset_set_dram_and_mpset_info_v3(struct neuron_mempool_set *mpset, u
 		device_dram_size[3] = V3_HBM_ACTIVE_SIZE;
 	}
 	int i;
-	for (i = 0; i < mpset->num_channels; i++) {
+	for (i = 0; i < mpset->num_hbms; i++) {
 		ndhal->ndhal_mpset.device_dram_end_addr[i] = device_dram_addr[i] + device_dram_size[i];
 	}
 }
@@ -1166,15 +1154,24 @@ static const u32 v3_pds_routing_id_to_user_id[] = {
 	12, 13,
 	14, 15 };
 
+static const u32 v3_max_routing_id_to_user_id[] = {
+	0, 1, 2, 3 };
+
 #define V3_ROUTING_ID_TBL_SZ  (sizeof(v3_torus_routing_id_to_user_id) / sizeof(v3_torus_routing_id_to_user_id[0]))
+#define V3_MAX_ROUTING_ID_TBL_SZ  (sizeof(v3_max_routing_id_to_user_id) / sizeof(v3_max_routing_id_to_user_id[0]))
 
 static u32 neuron_pci_routing_id_to_user_id(u32 routing_id)
 {
 	if (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_PDS) {
 		return v3_pds_routing_id_to_user_id[ routing_id % V3_ROUTING_ID_TBL_SZ];
 	}
+	if (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_MAX) {
+		return v3_max_routing_id_to_user_id[ routing_id % V3_MAX_ROUTING_ID_TBL_SZ];
+	}
 	return v3_torus_routing_id_to_user_id[ routing_id % V3_ROUTING_ID_TBL_SZ];
 }
+
+static atomic_t v3_trn2max_device_count = ATOMIC_INIT(0);
 
 /**
  * neuron_pci_get_device_id() - get device id and set nd->device_index
@@ -1189,6 +1186,14 @@ static int neuron_pci_get_device_id_v3(struct neuron_device *nd, struct pci_dev 
 	int i;
 	u32 routing_id = (u32)-1;
 	u32 routing_id_max = MAX_NEURON_DEVICE_COUNT;
+
+	// FW does not populate routing_id miscram regs on Trn2MAX servers,
+	// so assign device IDs sequentially by probe order instead.
+	if (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_MAX) {
+		routing_id = (u32)dhal_atomic_fetch_add(1, &v3_trn2max_device_count);
+		nd->device_index = neuron_pci_routing_id_to_user_id(routing_id);
+		goto done;
+	}
 
 	// Poll the device id until the device is ready
 	for (i = 0; i < 20; i++) {
@@ -1228,6 +1233,7 @@ static int neuron_pci_get_device_id_v3(struct neuron_device *nd, struct pci_dev 
 
 	nd->device_index = neuron_pci_routing_id_to_user_id(routing_id);
 
+done:
 	pr_err("** BDF: %2.2x:%2.2x.%x => nd[%d] (routing id: %u)\n", dev->bus->number, PCI_SLOT(dev->devfn), PCI_FUNC(dev->devfn), nd->device_index, routing_id);
 
 	// protection against duplicate IDs - doesn't provide 100% protection in multi-threaded device discovery
@@ -1252,25 +1258,14 @@ neuron_pci_device_id_to_rid_map_v3(uint32_t * count, uint32_t * did_to_rid_map)
 {
 	int i;
 
-	switch (ndhal->pci_device_id) {
-		case TRN2_DEVICE_ID0:
-		case TRN3_DEVICE_ID0:
-		case TRN3_DEVICE_ID1:
-			for (i = 0; i < total_neuron_devices; i++) {
-				u32 routing_id;
-				if (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_PDS) {
-					routing_id = i + ndhal->ndhal_arch.server_id * total_neuron_devices;
-				} else {
-					routing_id = i;
-				}
-				did_to_rid_map[neuron_pci_routing_id_to_user_id(routing_id)] = routing_id;
-			}
-			break;
-
-		default:
-			for (i = 0; i < total_neuron_devices; i++) {
-				did_to_rid_map[i] = i;
-			}
+	for (i = 0; i < total_neuron_devices; i++) {
+		u32 routing_id;
+		if (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_PDS) {
+			routing_id = i + ndhal->ndhal_arch.server_id * total_neuron_devices;
+		} else {
+			routing_id = i;
+		}
+		did_to_rid_map[neuron_pci_routing_id_to_user_id(routing_id)] = routing_id;
 	}
 
 	*count = total_neuron_devices;
@@ -1691,7 +1686,8 @@ static int npe_pod_info_v3(u8 *pod_type, u8 *pod_id, u8 *pod_sz, enum neuron_ult
 		*pod_sz = 0;
 		*mode = NEURON_ULTRASERVER_MODE_UNSET;
 		*modes_supported = 0;
-	} else if (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_PDS) {
+	} else if (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_PDS ||
+	           ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_MAX) {
 		*pod_type = NEURON_POD_TYPE_SWITCH;
 		npe_get_pod_sz(pod_sz);
 		npe_get_pod_id(pod_id);
@@ -1826,7 +1822,8 @@ static ssize_t npe_class_node_id_show_data_v3(char *buf, u32 sz)
  */
 static ssize_t npe_class_node_cnt_show_data_v3(char *buf)
 {
-	if (ndhal->ndhal_arch.platform_type != NEURON_PLATFORM_TYPE_PDS) {
+	if (ndhal->ndhal_arch.platform_type != NEURON_PLATFORM_TYPE_PDS &&
+	    ndhal->ndhal_arch.platform_type != NEURON_PLATFORM_TYPE_MAX) {
     	return dhal_sysfs_emit(buf, "-1\n");
 	}
 	return npe_class_node_cnt_show_data(buf);
@@ -1907,7 +1904,7 @@ static void ndhal_ext_cleanup_v3(void)
  * static asserts to valid static const sizes work across versions
  *
  */
-static_assert( MAX_DRAM_CHANNELS >= V3_MAX_DRAM_CHANNELS, "Max dram channel count too small");
+static_assert( MAX_NUM_HBMS >= V3_NUM_HBMS, "Max dram channel count too small");
 static_assert( MAX_TS_PER_DEVICE >= V3_TS_PER_DEVICE, "Max ts per device count too small");
 static_assert( MAX_NC_PER_DEVICE >= V3_NC_PER_DEVICE, "Max nc per device count too small");
 static_assert( MAX_NQ_TYPE >= V3_MAX_NQ_TYPE, "Max nq type count too small");
@@ -1943,7 +1940,8 @@ int ndhal_register_funcs_v3(void) {
 	ndhal->ndhal_address_map.event_count = V3_EVENTS_COUNT;
 	ndhal->ndhal_address_map.ts_per_device = V3_TS_PER_DEVICE;
 	ndhal->ndhal_address_map.dma_eng_per_nc = V3_DMA_ENG_PER_NC;
-	ndhal->ndhal_address_map.dram_channels = V3_MAX_DRAM_CHANNELS;
+	ndhal->ndhal_address_map.num_hbms = V3_NUM_HBMS;
+	ndhal->ndhal_address_map.nq_per_nc = V3_MAX_NQ_SUPPORTED;
 	ndhal->ndhal_reset.initiate_max_wait_time = V3_NR_RESET_INIT_MAX_TOTAL_WAIT_TIME_MS;
 	ndhal->ndhal_reset.retry_count = NR_RESET_RETRY_COUNT;
 	ndhal->ndhal_reset.nr_post_reset_config = nr_post_reset_config_v3;

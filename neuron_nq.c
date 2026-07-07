@@ -35,7 +35,7 @@ static int nnq_halt(struct neuron_device *nd, u8 nc_id, u8 eng_index, u32 nq_typ
 		return -EINVAL;
 
 	nq_id = ndhal->ndhal_nq.nnq_get_nqid(nd, nc_id, eng_index, nq_type);
-	if (nq_id >= MAX_NQ_SUPPORTED)
+	if (nq_id >= ndhal->ndhal_address_map.nq_per_nc)
 		return -EINVAL;
 
 	if (nd->nq_mc[nc_id][nq_id] == NULL) {
@@ -56,7 +56,7 @@ static int nnq_destroy(struct neuron_device *nd, u8 nc_id, u8 eng_index, u32 nq_
 		return -EINVAL;
 
 	nq_id = ndhal->ndhal_nq.nnq_get_nqid(nd, nc_id, eng_index, nq_type);
-	if (nq_id >= MAX_NQ_SUPPORTED)
+	if (nq_id >= ndhal->ndhal_address_map.nq_per_nc)
 		return -EINVAL;
 
 	if (nd->nq_mc[nc_id][nq_id] == NULL) {
@@ -68,9 +68,52 @@ static int nnq_destroy(struct neuron_device *nd, u8 nc_id, u8 eng_index, u32 nq_
 	return 0;
 }
 
+void nnq_destroy_storage(struct neuron_device *nd)
+{
+	int i;
+
+	if (!nd)
+		return;
+
+	for (i = 0; i < MAX_NC_PER_DEVICE; i++) {
+		kfree(nd->nq_mc[i]);
+		nd->nq_mc[i] = NULL;
+	}
+	for (i = 0; i < MAX_TS_PER_DEVICE; i++) {
+		kfree(nd->ts_nq_mc[i]);
+		nd->ts_nq_mc[i] = NULL;
+	}
+}
+
+int nnq_init_storage(struct neuron_device *nd)
+{
+	u16 sz = ndhal->ndhal_address_map.nq_per_nc;
+	int i;
+
+	if (sz == 0) {
+		pr_err("ndhal->ndhal_address_map.nq_per_nc is 0; ndhal not initialized\n");
+		return -EINVAL;
+	}
+
+	for (i = 0; i < MAX_NC_PER_DEVICE; i++) {
+		nd->nq_mc[i] = kcalloc(sz, sizeof(struct mem_chunk *), GFP_KERNEL);
+		if (!nd->nq_mc[i])
+			goto fail;
+	}
+	for (i = 0; i < MAX_TS_PER_DEVICE; i++) {
+		nd->ts_nq_mc[i] = kcalloc(sz, sizeof(struct mem_chunk *), GFP_KERNEL);
+		if (!nd->ts_nq_mc[i])
+			goto fail;
+	}
+	return 0;
+fail:
+	nnq_destroy_storage(nd);
+	return -ENOMEM;
+}
+
 
 int nnq_init(struct neuron_device *nd, u8 nc_id, u8 eng_index, u32 nq_type, u32 size,
-	     u32 on_host_memory, u32 dram_channel, u32 dram_region, bool force_alloc_mem,
+	     u32 on_host_memory, u32 hbm_index, bool force_alloc_mem,
 	     struct mem_chunk **nq_mc, u64 *mmap_offset)
 {
 	// Check that size is power of 2
@@ -83,14 +126,14 @@ int nnq_init(struct neuron_device *nd, u8 nc_id, u8 eng_index, u32 nq_type, u32 
 		return -EINVAL;
 
 	u8 nq_id = ndhal->ndhal_nq.nnq_get_nqid(nd, nc_id, eng_index, nq_type);
-	if (nq_id >= MAX_NQ_SUPPORTED)
+	if (nq_id >= ndhal->ndhal_address_map.nq_per_nc)
 		return -EINVAL;
 
 	struct mem_chunk *mc = nd->nq_mc[nc_id][nq_id];
 	if (mc == NULL || force_alloc_mem) {
 		struct mem_chunk *_mc = NULL;
 		int ret = mc_alloc_align(nd, MC_LIFESPAN_DEVICE, size, (on_host_memory) ? 0 : size, on_host_memory ? MEM_LOC_HOST : MEM_LOC_DEVICE,
-			       dram_channel, dram_region, nc_id, on_host_memory ? NEURON_MEMALLOC_TYPE_NOTIFICATION_HOST : NEURON_MEMALLOC_TYPE_NOTIFICATION_DEVICE, &_mc);
+			       hbm_index, nc_id, on_host_memory ? NEURON_MEMALLOC_TYPE_NOTIFICATION_HOST : NEURON_MEMALLOC_TYPE_NOTIFICATION_DEVICE, &_mc);
 		if (ret)
 			return ret;
 		ndhal->ndhal_nq.nnq_set_hwaddr(nd, nc_id, eng_index, nq_type, size, _mc->pa);

@@ -8,6 +8,9 @@
 #include <linux/types.h>
 #include "neuron_driver_shared_tensor_batch_op.h"
 
+/* Feature flags are soft capabilities. Adding a feature bit does not imply a
+ * runtime/driver hard compatibility ID bump.
+ */
 enum neuron_driver_feature_flag {
 	NEURON_DRIVER_FEATURE_DMABUF = 1ull <<  0, 
 	NEURON_DRIVER_FEATURE_ASYNC_DMA = 1ull <<  1, 
@@ -20,6 +23,7 @@ enum neuron_driver_feature_flag {
 	NEURON_DRIVER_FEATURE_ZEROCOPY = 1ull << 8,
 	NEURON_DRIVER_FEATURE_PINNED_HOST_MEM = 1ull << 9,
 	NEURON_DRIVER_FEATURE_ALLOC_WITH_PA   = 1ull << 10,
+	NEURON_DRIVER_FEATURE_ASYNC_IO        = 1ull << 11,
 };
 
 // FIXME  this should be more generic - like node type.

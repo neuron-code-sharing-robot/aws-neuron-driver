@@ -147,35 +147,25 @@ static int ndhal_register_funcs_trn3(void) {
 	return 0;
 }
 
-/* Instance names
- */
-#define NEURON_TRN3PDS_INSTANCE_NAME "trn3.48xlarge"
-#define NEURON_TRN3PDS0_INSTANCE_NAME "trn3-dev0.48xlarge"
-#define NEURON_TRN3PDS1_INSTANCE_NAME "trn3-dev1.48xlarge"
-#define NEURON_TRN3P_INSTANCE_NAME "trn3p.48xlarge"
+static const struct neuron_platform_lookup v4_platform_map[] = {
+	{"trn3e.24xlarge",      NEURON_PLATFORM_TYPE_MAX},
+	{"trn3e-dev0.24xlarge", NEURON_PLATFORM_TYPE_MAX},
+	{"trn3.48xlarge",      NEURON_PLATFORM_TYPE_PDS},
+	{"trn3-dev0.48xlarge", NEURON_PLATFORM_TYPE_PDS},
+	{"trn3-dev1.48xlarge", NEURON_PLATFORM_TYPE_PDS},
+	{"trn3p.48xlarge",     NEURON_PLATFORM_TYPE_ULTRASERVER},
+	{NULL,                 NEURON_PLATFORM_TYPE_INVALID},
+};
 
 static enum neuron_platform_type ndhal_platform_type_v4(void)
 {
-	enum neuron_platform_type platform_type = NEURON_PLATFORM_TYPE_INVALID;
-	char buf[128];
+	enum neuron_platform_type platform_type;
 
-	if (narch_get_instance_type_name(buf, sizeof(buf))) goto done;
-	if ((strncmp(buf, NEURON_TRN3PDS_INSTANCE_NAME, sizeof(NEURON_TRN3PDS_INSTANCE_NAME)-1) == 0)) {
-		platform_type = NEURON_PLATFORM_TYPE_PDS;
-	} else if ((strncmp(buf, NEURON_TRN3PDS0_INSTANCE_NAME, sizeof(NEURON_TRN3PDS0_INSTANCE_NAME)-1) == 0)) {
-		platform_type = NEURON_PLATFORM_TYPE_PDS;
-	} else if ((strncmp(buf, NEURON_TRN3PDS1_INSTANCE_NAME, sizeof(NEURON_TRN3PDS1_INSTANCE_NAME)-1) == 0)) {
-		platform_type = NEURON_PLATFORM_TYPE_PDS;
-	} else if ((strncmp(buf, NEURON_TRN3P_INSTANCE_NAME, sizeof(NEURON_TRN3P_INSTANCE_NAME)-1) == 0)) {
-		platform_type = NEURON_PLATFORM_TYPE_ULTRASERVER;
-	} else {
-		platform_type = NEURON_PLATFORM_TYPE_STD;
-	}
+	platform_type = narch_detect_platform_type(v4_platform_map);
 
 	if (narch_is_qemu() || narch_is_emu())
 		platform_type = NEURON_PLATFORM_TYPE_STD;
 
-done:
 	return platform_type;
 }
 
@@ -232,8 +222,7 @@ static void ndmar_ctx_queue_from_bit_v4(int bit, uint32_t *h2d_eng_id, uint32_t 
  */
 static void mpset_set_dram_and_mpset_info_v4(struct neuron_mempool_set *mpset, u64 *device_dram_addr, u64 *device_dram_size)
 {
-	mpset->num_channels = V4_MAX_DRAM_CHANNELS;
-	mpset->mp_device_num_regions = 1;
+	mpset->num_hbms = V4_NUM_HBMS;
 	device_dram_addr[0] = V4_HBM_0_BASE;
 	device_dram_addr[1] = V4_HBM_1_BASE;
 	device_dram_addr[2] = V4_HBM_2_BASE;
@@ -265,7 +254,7 @@ static void mpset_set_dram_and_mpset_info_v4(struct neuron_mempool_set *mpset, u
 		device_dram_size[3] = V4_HBM_ACTIVE_SIZE;
 	}
 	int i;
-	for (i = 0; i < mpset->num_channels; i++) {
+	for (i = 0; i < mpset->num_hbms; i++) {
 		ndhal->ndhal_mpset.device_dram_end_addr[i] = device_dram_addr[i] + device_dram_size[i];
 	}
 }
@@ -323,12 +312,19 @@ static const u32 v4_pds_routing_id_to_user_id[] = {
 	12, 13,
 	14, 15 };
 
+static const u32 v4_max_routing_id_to_user_id[] = {
+	0, 1, 2, 3 };
+
 #define V4_ROUTING_ID_TBL_SZ  (sizeof(v4_torus_routing_id_to_user_id) / sizeof(v4_torus_routing_id_to_user_id[0]))
+#define V4_MAX_ROUTING_ID_TBL_SZ  (sizeof(v4_max_routing_id_to_user_id) / sizeof(v4_max_routing_id_to_user_id[0]))
 
 static u32 neuron_pci_routing_id_to_user_id(u32 routing_id)
 {
 	if (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_PDS) {
 		return v4_pds_routing_id_to_user_id[ routing_id % V4_ROUTING_ID_TBL_SZ];
+	}
+	if (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_MAX) {
+		return v4_max_routing_id_to_user_id[ routing_id % V4_MAX_ROUTING_ID_TBL_SZ];
 	}
 	return v4_torus_routing_id_to_user_id[routing_id % V4_ROUTING_ID_TBL_SZ];
 }
@@ -367,7 +363,8 @@ static int neuron_pci_get_device_id_v4(struct neuron_device *nd, struct pci_dev 
 		return -ENODEV;
 	}
 
-	if (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_PDS) {
+	if (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_PDS ||
+	    ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_MAX) {
 		int server_id;
 
 		ret = fw_io_server_info_read(nd->npdev.bar0, &server_id, NULL);
@@ -453,6 +450,25 @@ static void perf_update_hbm_7200_supported_v4(struct neuron_device *nd) {
 	return;
 }
 
+static int neuron_pci_device_id_to_rid_map_v4(uint32_t *count, uint32_t *did_to_rid_map)
+{
+	int i;
+
+	for (i = 0; i < total_neuron_devices; i++) {
+		u32 routing_id;
+		if (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_PDS ||
+		    ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_MAX) {
+			routing_id = i + ndhal->ndhal_arch.server_id * total_neuron_devices;
+		} else {
+			routing_id = i;
+		}
+		did_to_rid_map[neuron_pci_routing_id_to_user_id(routing_id)] = routing_id;
+	}
+
+	*count = total_neuron_devices;
+	return 0;
+}
+
 /**
  * ndhal_register_funcs_v4() - initialize the dhal for v4 chips
  *
@@ -470,6 +486,7 @@ int ndhal_register_funcs_v4(void) {
 	ndhal->ndhal_arch.platform_type = ndhal_platform_type_v4();
 	ndhal->ndhal_fw_io.new_readless_read_min_api_version = 6;
 	ndhal->ndhal_pci.neuron_pci_get_device_id = neuron_pci_get_device_id_v4;
+	ndhal->ndhal_pci.neuron_pci_device_id_to_rid_map = neuron_pci_device_id_to_rid_map_v4;
 	ndhal->ndhal_npe.npe_neighbor_eng_ids = npe_neighbor_eng_ids_v4;
 	ndhal->ndhal_mpset.mpset_set_dram_and_mpset_info = mpset_set_dram_and_mpset_info_v4;
 	ndhal->ndhal_mmap.dm_mmap_special = dm_mmap_special_v4;
@@ -496,6 +513,8 @@ int ndhal_register_funcs_v4(void) {
 		}
 	} else if (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_PDS) {
 		//TODO PDS
+	    ndhal->ndhal_cdev.ncdev_logical_to_physical_nc_map = ncdev_logical_to_physical_nc_map_v4;
+	} else if (ndhal->ndhal_arch.platform_type == NEURON_PLATFORM_TYPE_MAX) {
 	    ndhal->ndhal_cdev.ncdev_logical_to_physical_nc_map = ncdev_logical_to_physical_nc_map_v4;
 	}	
 

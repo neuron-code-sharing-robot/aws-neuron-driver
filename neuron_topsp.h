@@ -16,8 +16,7 @@
  * @nq_type: type of the notification queue
  * @size: size of queue in bytes
  * @on_host_memory: if true, NQ is created in host memory
- * @dram_channel: If NQ is created on device memory which DRAM channel to use.
- * @dram_region: If NQ is created on device memory which DRAM region to use.
+ * @hbm_index: If NQ is created on device memory which HBM to use.
  * @force_alloc_mem: If true, force allocate new memory (and delete already allocated memory, if any)
  * @nq_mc[out]: memchunk used by the NQ will be written here
  * @mc_ptr[out]: Pointer to memchunk backing this NQ
@@ -25,7 +24,7 @@
  * Return: 0 on if initialization succeeds, a negative error code otherwise.
  */
 int ts_nq_init(struct neuron_device *nd, u8 ts_id, u8 eng_index, u32 nq_type, u32 size,
-	       u32 on_host_memory, u32 dram_channel, u32 dram_region,
+	       u32 on_host_memory, u32 hbm_index,
 	       bool force_alloc_mem, struct mem_chunk **nq_mc, u64 *mmap_offset);
 
 /**

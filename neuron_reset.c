@@ -190,7 +190,11 @@ static int nr_reset_thread_fn(void *arg)
 			if (!nd->nr.req_cmpl_head) {
 				nd->nr.req_cmpl_head = first_request;
 			}
-			ITER_COAL_REQS(request_iter, first_request, last_request, request_iter->ret = state;)
+			ITER_COAL_REQS(request_iter, first_request, last_request,
+				// Write error_code before state so nr_wait sees the error code
+				// once it observes the state change. smp_wmb() is needed as
+				// nr_wait polls req->ret without holding nr_lock.
+				request_iter->error_code = ret; smp_wmb(); request_iter->ret = state;)
 		}
 		mutex_unlock(&nd->nr.nr_lock);
 	}
@@ -203,8 +207,10 @@ int nr_create_thread(struct neuron_device *nd)
 	init_waitqueue_head(&nd->nr.wait_queue);
 	nd->nr.thread = kthread_run(nr_reset_thread_fn, nd, "nd%d reset", nd->device_index);
 	if (IS_ERR_OR_NULL(nd->nr.thread)) {
+		int err = IS_ERR(nd->nr.thread) ? PTR_ERR(nd->nr.thread) : -ENOMEM;
+		nd->nr.thread = NULL;
 		pr_err("nd%d reset thread creation failed\n", nd->device_index);
-		return -1;
+		return err;
 	}
 	return 0;
 }
@@ -273,7 +279,7 @@ int nr_start_ncs(struct neuron_device *nd, uint32_t nc_map, uint32_t request_id)
 	if (nr_find_req(nd, request_id)) {
 		pr_err("Pending reset request for pid %u on device %u already exists!", request_id, nd->device_index);
 		mutex_unlock(&nd->nr.nr_lock);
-		return 1;
+		return -EALREADY;
 	}
 	if (request_id == NEURON_RESET_REQUEST_ALL) {
 		nd->device_state = NEURON_DEVICE_STATE_RESET;
@@ -293,11 +299,14 @@ int nr_start_ncs(struct neuron_device *nd, uint32_t nc_map, uint32_t request_id)
 	if (!req) {
 		pr_err("Failed to allocate memory for reset request %u for nd %u", request_id, nd->device_index);
 		mutex_unlock(&nd->nr.nr_lock);
-		return 1;
+		return -ENOMEM;
 	}
 	req->request_id = request_id;
 	req->nc_map = nc_map;
 	req->ret = NEURON_RESET_STATE_STARTED;
+	// No smp_wmb() needed — these writes are under nr_lock. mutex_unlock
+	// provides a full barrier, so nr_wait will see these values in order.
+	req->error_code = 0;
 	req->next = NULL;
 	req->prev = NULL;
 	if (nd->nr.req_pending_tail) {
@@ -335,7 +344,7 @@ int nr_wait(struct neuron_device *nd, uint32_t request_id, bool check)
 			return 0;
 		} else {
 			pr_err("Invalid reset request id %u", request_id);
-			return 1;
+			return -ENOENT;
 		}
 	}
 
@@ -365,8 +374,14 @@ int nr_wait(struct neuron_device *nd, uint32_t request_id, bool check)
 	}
 	mutex_unlock(&nd->nr.nr_lock);
 	enum neuron_reset_state ret = req->ret;
+	// Pairs with smp_wmb() in nr_reset_thread_fn. Ensures error_code is
+	// read after ret, since we poll ret without holding nr_lock.
+	smp_rmb();
+	int error_code = req->error_code;
 	kfree((void *)req);
-	return ((ret == NEURON_RESET_STATE_COMPLETED) ? 0 : 1);
+	if (ret == NEURON_RESET_STATE_COMPLETED)
+		return 0;
+	return error_code ? error_code : -EIO;
 }
 
 bool nr_op_in_reset_wnd(uint64_t op_start_time, struct neuron_device *nd)

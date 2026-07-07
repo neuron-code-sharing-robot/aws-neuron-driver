@@ -150,6 +150,10 @@ static int neuron_pci_device_init(struct neuron_device *nd)
 	if (ret)
 		goto fail_mpset;
 
+	ret = nnq_init_storage(nd);
+	if (ret)
+		goto fail_nq_mc;
+
 	// Initialize CRWL struct
 	for (i = 0; i < MAX_NC_PER_DEVICE; i++)
 		mutex_init(&nd->crwl[i].lock);
@@ -164,11 +168,15 @@ static int neuron_pci_device_init(struct neuron_device *nd)
 
 	ret = nr_start_ncs(nd, NEURON_NC_MAP_DEVICE, NEURON_RESET_REQUEST_ALL);
 	if (ret)
-		return ret;
+		goto fail_start_ncs;
 
 	return 0;
 
+fail_start_ncs:
+	ncdev_delete_device_node(nd);
 fail_chardev:
+	nnq_destroy_storage(nd);
+fail_nq_mc:
 	mpset_destructor(&nd->mpset);
 fail_mpset:
 	nmch_handle_cleanup(nd);
@@ -190,6 +198,7 @@ static int neuron_pci_device_close(struct neuron_device *nd)
 	}
 	// disable NQ after disabling PCI device so that the device cant DMA anything after this
 	nnq_destroy_all(nd);
+	nnq_destroy_storage(nd);
 	ndmar_close(nd);
 	neuron_ds_destroy(&nd->datastore);
 	mpset_destructor(&nd->mpset);
@@ -445,13 +454,13 @@ static int neuron_pci_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	if (ret)
 		goto fail_nds_resource;
 
-	ret = mc_alloc_align(nd, MC_LIFESPAN_DEVICE, NDMA_QUEUE_DUMMY_RING_SIZE, 0, MEM_LOC_HOST, 0, 0, 0, NEURON_MEMALLOC_TYPE_NCDEV_HOST,
+	ret = mc_alloc_align(nd, MC_LIFESPAN_DEVICE, NDMA_QUEUE_DUMMY_RING_SIZE, 0, MEM_LOC_HOST, 0, 0, NEURON_MEMALLOC_TYPE_NCDEV_HOST,
 		       &nd->ndma_q_dummy_mc);
 	if (ret)
 		goto fail_nds_resource;
 
 	// allocate memset mc (if datastore succeeded)
-	ret = mc_alloc_align(nd, MC_LIFESPAN_DEVICE, MEMSET_HOST_BUF_SIZE, 0, MEM_LOC_HOST, 0, 0, 0, NEURON_MEMALLOC_TYPE_NCDEV_HOST,
+	ret = mc_alloc_align(nd, MC_LIFESPAN_DEVICE, MEMSET_HOST_BUF_SIZE, 0, MEM_LOC_HOST, 0, 0, NEURON_MEMALLOC_TYPE_NCDEV_HOST,
 		       &nd->memset_mc);
 	if (ret)
 		goto fail_memset_mc;
